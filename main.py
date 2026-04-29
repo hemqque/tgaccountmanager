@@ -1,0 +1,3605 @@
+# -*- coding: utf-8 -*-
+"""
+main.py — Бот-менеджер фермы Telegram-аккаунтов (aiogram 3.x).
+
+Файл разбит на логические секции — внутри файла ищите заголовки вида
+"── СЕКЦИЯ ──". Большие блоки приведены в порядке: служебное → главное
+меню → разделы (Аккаунты / Автоматизация / Управление / Прогресс) →
+Админ-панель → bootstrap & main().
+"""
+
+# =================================================================
+# ── СЕКЦИЯ: ИМПОРТЫ ──
+# =================================================================
+import asyncio
+import logging
+import os
+import random
+import re
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+    BufferedInputFile, FSInputFile,
+)
+from aiogram.exceptions import TelegramBadRequest
+
+from telethon import TelegramClient
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
+    FloodWaitError,
+)
+from telethon.tl.functions.account import UpdateProfileRequest
+from telethon.tl.functions.photos import (
+    UploadProfilePhotoRequest, DeletePhotosRequest, GetUserPhotosRequest,
+)
+from telethon.tl.types import InputPhoto
+
+import config
+import db
+import utils
+from utils import (
+    is_allowed, restore_main_menu, ask_with_cancel, validate_phone,
+    validate_proxy, safe_delete_folder, auto_join_channels, rand_sleep,
+    main_menu_keyboard, attach_pending_router, has_pending,
+    register_pending_text,
+)
+from store import Store
+from task_queue import TaskQueue
+from autoreply import AutoreplyManager
+from autoreply_rules import DEFAULT_REPLY_TEXT
+from progress import _start_progress, _update_progress, _finish_progress
+from account_setup import setup_account
+import global_proxy
+from global_proxy import (
+    parse_proxy_string, proxy_to_telethon, get_proxy_for_account,
+    check_proxy_connection, run_health_check_loop, reassign_phones,
+    count_alive_socks5,
+    get_sticky_global_proxy, mask_proxy, proxy_host,
+    apply_global_to_unproxied, set_admin_notifier,
+)
+from ldv_functions import (
+    register_one_ldv, ldv_liking_task, ldv_scheduler, ldv_attach_listener,
+)
+from xo_functions import (
+    register_one_xo, xo_liking_task, xo_liking_scheduler,
+)
+from reg_resume import register_ldv_resumable, register_xo_resumable
+
+
+# =================================================================
+# ── СЕКЦИЯ: ЛОГИРОВАНИЕ ──
+# =================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("main")
+
+
+# =================================================================
+# ── СЕКЦИЯ: ГЛОБАЛЬНЫЕ ОБЪЕКТЫ ──
+# =================================================================
+bot = Bot(
+    token=config.BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode="HTML"),
+)
+dp = Dispatcher()
+
+# Главный объект состояния
+store = Store()
+
+# Очередь «тяжёлых» задач (массовый залив, регистрации и т. п.)
+task_queue = TaskQueue(max_concurrent=config.MAX_CONCURRENT_TASKS)
+
+# Менеджер автоответов
+ar_manager = AutoreplyManager()
+
+# Глобальные кеши Telethon-клиентов (для управления аккаунтами:
+# редактирование профиля, получение кода и пр.).
+# Ключ — phone, значение — TelegramClient.
+_account_clients: Dict[str, TelegramClient] = {}
+
+# Сессии добавления аккаунта (ввод кода/пароля): uid -> dict
+_signin_sessions: Dict[int, Dict[str, Any]] = {}
+
+
+# =================================================================
+# ── СЕКЦИЯ: HELPER-ФУНКЦИИ ──
+# =================================================================
+async def notify_owner(owner_id: int, text: str) -> None:
+    """Послать сообщение пользователю-владельцу. Без падений."""
+    try:
+        await bot.send_message(owner_id, text)
+    except Exception as e:
+        log.debug("notify_owner(%s): %s", owner_id, e)
+
+
+async def user_log(uid: int, text: str) -> None:
+    """Если у пользователя включены логи — отправить «📋 <text>»."""
+    try:
+        s = await db.db_user_settings_get(uid)
+        if s.get("logs_enabled"):
+            await bot.send_message(uid, f"📋 {text}")
+    except Exception:
+        pass
+
+
+async def get_or_create_account_client(phone: str,
+                                       owner_id: Optional[int] = None
+                                       ) -> Optional[TelegramClient]:
+    """
+    Возвращает уже подключённый Telethon-клиент для аккаунта `phone`.
+    При первом обращении создаёт его (с прокси из БД), connect+авторизация.
+    """
+    cli = _account_clients.get(phone)
+    if cli and cli.is_connected():
+        return cli
+    proxy = await get_proxy_for_account(
+        phone, owner_id if owner_id is not None else 0
+    )
+    tproxy = proxy_to_telethon(proxy or "")
+    session_path = os.path.join(config.SESSIONS_DIR, phone)
+    os.makedirs(config.SESSIONS_DIR, exist_ok=True)
+    cli = TelegramClient(session_path, config.API_ID, config.API_HASH,
+                         proxy=tproxy)
+    try:
+        await cli.connect()
+        if not await cli.is_user_authorized():
+            await cli.disconnect()
+            return None
+    except Exception as e:
+        log.warning("get_or_create_account_client(%s): %s", phone, e)
+        try:
+            await cli.disconnect()
+        except Exception:
+            pass
+        return None
+    _account_clients[phone] = cli
+    return cli
+
+
+def kb(*rows) -> InlineKeyboardMarkup:
+    """Шорткат для построения inline-клавиатуры из туплов (text, callback)."""
+    out = []
+    for row in rows:
+        out.append([
+            InlineKeyboardButton(text=t, callback_data=c) for (t, c) in row
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=out)
+
+
+def home_btn() -> Tuple[str, str]:
+    return ("🏠 Главное меню", "action_cancel")
+
+
+# =================================================================
+# ── СЕКЦИЯ: МИДЛВАРЬ ДОСТУПА ──
+# =================================================================
+@dp.update.outer_middleware()
+async def access_middleware(handler, event, data):
+    """
+    Любой апдейт от неизвестного user_id → отказ.
+    Только admins и whitelist допускаются.
+    """
+    uid = None
+    msg_or_cb = None
+    if event.message:
+        uid = event.message.from_user.id if event.message.from_user else None
+        msg_or_cb = event.message
+    elif event.callback_query:
+        uid = event.callback_query.from_user.id
+        msg_or_cb = event.callback_query
+    elif event.inline_query:
+        uid = event.inline_query.from_user.id
+    if uid is None:
+        return await handler(event, data)
+    if await is_allowed(uid):
+        return await handler(event, data)
+
+    # отказ
+    try:
+        if isinstance(msg_or_cb, Message):
+            await msg_or_cb.answer("⛔ У вас нет доступа к этому боту.")
+        elif isinstance(msg_or_cb, CallbackQuery):
+            await msg_or_cb.answer("⛔ Нет доступа.", show_alert=True)
+    except Exception:
+        pass
+    return  # не передаём дальше
+
+
+# =================================================================
+# ── СЕКЦИЯ: ROUTER «ПЕРЕХВАТ ОТВЕТОВ ask_with_cancel» ──
+# =================================================================
+# должен идти ПЕРВЫМ, чтобы отлавливать текст ДО других хендлеров.
+pending_router = Router(name="pending")
+attach_pending_router(pending_router)
+dp.include_router(pending_router)
+
+
+# =================================================================
+# ── СЕКЦИЯ: GUARD CALLBACK при active_action (через middleware) ──
+# =================================================================
+@dp.callback_query.outer_middleware()
+async def _callback_guard_mw(handler, event: CallbackQuery, data):
+    """
+    Middleware-страж: блокирует callback-и (кроме action_cancel) у
+    пользователей с активным действием. В aiogram 3.x обычный handler
+    «съел бы» все callback-ы — поэтому используем middleware, которое
+    может либо позвать next handler, либо ответить alert и НЕ звать.
+    """
+    if not event.data:
+        return await handler(event, data)
+    if event.data == "action_cancel":
+        return await handler(event, data)
+    uid = event.from_user.id if event.from_user else 0
+    if uid and store.is_busy(uid):
+        try:
+            await event.answer(
+                "⏳ Завершите текущее действие или нажмите 'Главное меню'.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+        return  # не передаём дальше
+    return await handler(event, data)
+
+
+# =================================================================
+# ── СЕКЦИЯ: /start, главное меню ──
+# =================================================================
+@dp.message(CommandStart())
+async def handle_start(msg: Message):
+    uid = msg.from_user.id
+    is_admin = await db.db_admins_check(uid)
+    text = "Добро пожаловать в менеджер аккаунтов."
+    await msg.answer(text, reply_markup=main_menu_keyboard(is_admin))
+
+
+@dp.message(F.text == "🏠 Главное меню")
+async def handle_home(msg: Message):
+    uid = msg.from_user.id
+    store.reset_user(uid)
+    await restore_main_menu(bot, msg.chat.id, uid,
+                            "Возврат в главное меню.")
+
+
+@dp.callback_query(F.data == "action_cancel")
+async def cb_action_cancel(cb: CallbackQuery):
+    uid = cb.from_user.id
+    store.reset_user(uid)
+    _tdata_sessions.pop(uid, None)
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await restore_main_menu(bot, cb.message.chat.id, uid,
+                            "Возврат в главное меню.")
+    await cb.answer()
+
+
+# =================================================================
+# ── СЕКЦИЯ: ПЕРЕКЛЮЧАТЕЛИ ВЕРХНИХ РАЗДЕЛОВ ──
+# =================================================================
+@dp.message(F.text == "⚙️ Аккаунты")
+async def handle_section_accounts(msg: Message):
+    if has_pending(msg.from_user.id):  # не мешать ask_with_cancel
+        return
+    await msg.answer(
+        "⚙️ <b>Аккаунты</b>",
+        reply_markup=kb(
+            [("➕ Добавить аккаунт", "acc_add")],
+            [("📦 Импорт TData (ZIP)", "acc_tdata"),
+             ("📂 Импорт TData (папка)", "acc_tdata_local")],
+            [("📥 Импорт сессий (ZIP)", "acc_session_zip"),
+             ("📥 Импорт сессий (папка)", "acc_session_local")],
+            [("📱 Мои аккаунты", "acc_list:0")],
+            [("🔑 Мои прокси", "px_list")],
+            [("📡 Применить глобал к моим без-прокси",
+              "acc_apply_global")],
+            [home_btn()],
+        ),
+    )
+
+
+@dp.callback_query(F.data == "acc_apply_global")
+async def cb_acc_apply_global(cb: CallbackQuery):
+    """
+    Применить глобальные прокси к аккаунтам пользователя, у которых
+    accounts.proxy="". Перед применением — health-check всех глобалов
+    (Q2 — обязательная проверка). Раздаём с повторением (Q13 C).
+    """
+    uid = cb.from_user.id
+    await cb.answer("Проверяю и применяю…")
+    res = await apply_global_to_unproxied(uid, recheck=True)
+    await cb.message.answer(
+        "📡 <b>Применение глобал-прокси</b>\n"
+        f"Живых глобалов после проверки: <b>{res['alive_globals']}</b>\n"
+        f"Назначено аккаунтам: <b>{res['updated']}</b>\n"
+        f"Без прокси осталось: <b>{res['skipped']}</b>"
+    )
+
+
+@dp.message(F.text == "🤖 Автоматизация")
+async def handle_section_auto(msg: Message):
+    if has_pending(msg.from_user.id):
+        return
+    await msg.answer(
+        "🤖 <b>Автоматизация</b>",
+        reply_markup=kb(
+            [("🚀 Массовый залив", "auto_mass")],
+            [("🤖 Рега ЛДВ", "auto_ldv")],
+            [("💘 Рега XO", "auto_xo")],
+            [("📺 Подписка на ДВ", "auto_subdv")],
+            [("💬 Автоответы", "auto_ar")],
+            [home_btn()],
+        ),
+    )
+
+
+@dp.message(F.text == "📊 Управление")
+async def handle_section_manage(msg: Message):
+    if has_pending(msg.from_user.id):
+        return
+    await msg.answer(
+        "📊 <b>Управление</b>",
+        reply_markup=kb(
+            [("💘 Рега XO", "mng_xo")],
+            [("❤️ Ручной пролайк ДВ", "mng_manual_ldv")],
+            [("⚙️ Управление лайкингом", "mng_ldv")],
+            [("💘 Управление XO", "mng_xo_panel")],
+            [("🛑 Отмена регистрации", "mng_regcancel")],
+            [home_btn()],
+        ),
+    )
+
+
+@dp.message(F.text == "📈 Прогресс")
+async def handle_section_progress(msg: Message):
+    if has_pending(msg.from_user.id):
+        return
+    uid = msg.from_user.id
+    s = task_queue.status()
+    accs = await db.db_get_accounts_by_owner(uid)
+    ldv_tasks = await db.db_get_ldv_tasks_by_owner(uid)
+    xo_tasks = await db.db_get_xo_tasks_by_owner(uid)
+    user_settings = await db.db_user_settings_get(uid)
+    logs_on = bool(user_settings.get("logs_enabled"))
+
+    text = (
+        "📈 <b>Прогресс</b>\n\n"
+        f"👤 Аккаунтов: <b>{len(accs)}</b>\n"
+        f"🤖 LDV-задач: <b>{len(ldv_tasks)}</b> "
+        f"(running: {sum(1 for t in ldv_tasks if t['status']=='running')}, "
+        f"pending: {sum(1 for t in ldv_tasks if t['status']=='pending')})\n"
+        f"💘 XO-задач: <b>{len(xo_tasks)}</b> "
+        f"(running: {sum(1 for t in xo_tasks if t['status']=='running')}, "
+        f"paused: {sum(1 for t in xo_tasks if t['status']=='paused')})\n"
+        f"⚙️ Очередь: running={s['running']}, waiting={s['waiting']}, "
+        f"max={s['max']}\n"
+        f"📋 Логи: {'✅ Вкл' if logs_on else '❌ Выкл'}"
+    )
+    await msg.answer(
+        text,
+        reply_markup=kb(
+            [(("📋 Логи: Выкл" if logs_on else "📋 Логи: Вкл"),
+              "prog_logs_toggle")],
+            [home_btn()],
+        ),
+    )
+
+
+@dp.callback_query(F.data == "prog_logs_toggle")
+async def cb_prog_logs_toggle(cb: CallbackQuery):
+    uid = cb.from_user.id
+    s = await db.db_user_settings_get(uid)
+    new_val = not bool(s.get("logs_enabled"))
+    await db.db_user_settings_set_logs(uid, new_val)
+    await cb.answer(f"Логи {'включены' if new_val else 'выключены'}.")
+
+
+@dp.message(F.text == "👑 Админ")
+async def handle_section_admin(msg: Message):
+    if has_pending(msg.from_user.id):
+        return
+    if not await db.db_admins_check(msg.from_user.id):
+        return await msg.answer("⛔ Нет доступа.")
+    await msg.answer(
+        "👑 <b>Админ-панель</b>",
+        reply_markup=kb(
+            [("👥 Whitelist", "adm_wl")],
+            [("👮 Админы", "adm_admins")],
+            [("🌐 Глобальные прокси", "gpx_list")],
+            [("📋 Все аккаунты", "adm_all_accs")],
+            [home_btn()],
+        ),
+    )
+
+
+# =================================================================
+# ── СЕКЦИЯ: ГЛОБАЛЬНЫЙ СБОРЩИК ФОТО ──
+# =================================================================
+@dp.message(F.photo)
+async def handle_photo(msg: Message):
+    """
+    Если пользователь сейчас «собирает» фото (store.photo_collecting[uid]),
+    то скачиваем фото в temp/<uid>/ и добавляем путь в store.temp_photos[uid].
+    Дедупликация по file_unique_id.
+    """
+    uid = msg.from_user.id
+    # Если есть активный ask_with_cancel — пусть отлавливает текст,
+    # а фото игнорим (или, если ожидание текста — кидаем "не текст")
+    if has_pending(uid):
+        return
+    if not store.photo_collecting.get(uid):
+        return
+
+    # Берём максимальный размер
+    photo = msg.photo[-1]
+    fuid = photo.file_unique_id
+    seen = store.collected_photos.setdefault(uid, set())
+    if fuid in seen:
+        return
+    seen.add(fuid)
+
+    folder = os.path.join(config.TEMP_DIR, f"u_{uid}")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"{int(time.time()*1000)}_{fuid}.jpg")
+    try:
+        f = await bot.get_file(photo.file_id)
+        await bot.download_file(f.file_path, destination=path)
+        store.add_temp_photo(uid, path)
+    except Exception as e:
+        log.warning("download photo: %s", e)
+        return
+
+    n = len(store.get_temp_photos(uid))
+    try:
+        await msg.answer(f"📷 Фото {n} принято.")
+    except Exception:
+        pass
+
+
+# =================================================================
+# ── СЕКЦИЯ: ⚙️ АККАУНТЫ — ДОБАВЛЕНИЕ ──
+# =================================================================
+@dp.callback_query(F.data == "acc_add")
+async def cb_acc_add(cb: CallbackQuery):
+    uid = cb.from_user.id
+    if store.is_busy(uid):
+        return await cb.answer("⏳ Уже идёт другое действие.", show_alert=True)
+    store.set_action(uid, "acc_add")
+    await cb.answer()
+
+    try:
+        raw = await ask_with_cancel(
+            bot, cb.message.chat.id, uid,
+            "📱 Пришлите номера телефонов (через запятую или с новой строки).\n"
+            "Пример:\n+79991112233\n+79994445566",
+        )
+        if raw is None:
+            await restore_main_menu(bot, cb.message.chat.id, uid,
+                                    "Отменено.")
+            return
+        phones = []
+        for tok in re.split(r"[,\n;\s]+", raw):
+            p = validate_phone(tok)
+            if p:
+                phones.append(p)
+        # дедуп
+        phones = list(dict.fromkeys(phones))
+        if not phones:
+            await bot.send_message(uid, "❌ Не нашёл валидных номеров.")
+            await restore_main_menu(bot, cb.message.chat.id, uid)
+            return
+
+        await bot.send_message(uid, f"🔄 К обработке: {len(phones)} номер(ов).")
+
+        async def _run_add():
+            await _start_progress(bot, cb.message.chat.id, uid,
+                                  total=len(phones), store=store,
+                                  title="➕ Добавление аккаунтов")
+            ok_count = 0
+            for ph in phones:
+                await _update_progress(bot, uid, store, current=ph)
+                try:
+                    res = await _add_one_account(uid, cb.message.chat.id, ph)
+                    if res:
+                        ok_count += 1
+                    await _update_progress(bot, uid, store, done_inc=1,
+                                           current=None,
+                                           error=None if res
+                                           else f"{ph}: не добавлен")
+                except Exception as e:
+                    await _update_progress(bot, uid, store, done_inc=1,
+                                           current=None,
+                                           error=f"{ph}: {e}")
+            await _finish_progress(bot, uid, store,
+                                   summary_extra=f"Добавлено: {ok_count}/"
+                                                 f"{len(phones)}")
+            await restore_main_menu(bot, cb.message.chat.id, uid)
+
+        await task_queue.submit(
+            _run_add, owner_id=uid, notify=notify_owner,
+            title=f"Добавление {len(phones)} аккаунтов",
+        )
+    finally:
+        store.set_action(uid, None)
+
+
+async def _add_one_account(uid: int, chat_id: int, phone: str) -> bool:
+    """Полный сценарий добавления одного аккаунта. True/False."""
+    # 1. proxy
+    proxy_raw = await ask_with_cancel(
+        bot, chat_id, uid,
+        f"🛡 Прокси для <code>{phone}</code> "
+        f"(host:port:user:pass или «Нет»):",
+    )
+    if proxy_raw is None:
+        await bot.send_message(uid, f"⏭ Пропущено: {phone}")
+        return False
+    if not validate_proxy(proxy_raw):
+        await bot.send_message(uid, f"❌ {phone}: некорректный прокси.")
+        return False
+    if proxy_raw.strip().lower() in ("нет", "no", "none", "-", "без прокси"):
+        proxy_str = ""
+    else:
+        proxy_str = proxy_raw.strip()
+
+    # 2. Telethon connect + send_code
+    os.makedirs(config.SESSIONS_DIR, exist_ok=True)
+    session_path = os.path.join(config.SESSIONS_DIR, phone)
+    tproxy = proxy_to_telethon(proxy_str)
+    client = TelegramClient(session_path, config.API_ID, config.API_HASH,
+                            proxy=tproxy)
+    try:
+        await client.connect()
+        if await client.is_user_authorized():
+            await bot.send_message(uid, f"ℹ️ {phone}: уже авторизован.")
+        else:
+            sent = await client.send_code_request(phone)
+            code = await ask_with_cancel(
+                bot, chat_id, uid,
+                f"🔢 Введите SMS-код для <code>{phone}</code>:",
+            )
+            if not code:
+                await bot.send_message(uid, f"⏭ Отменено: {phone}")
+                await client.disconnect()
+                return False
+            try:
+                await client.sign_in(phone=phone, code=code.strip(),
+                                     phone_code_hash=sent.phone_code_hash)
+            except SessionPasswordNeededError:
+                pwd = await ask_with_cancel(
+                    bot, chat_id, uid,
+                    f"🔐 2FA-пароль для <code>{phone}</code>:",
+                )
+                if not pwd:
+                    await bot.send_message(uid, f"⏭ Отменено: {phone}")
+                    await client.disconnect()
+                    return False
+                await client.sign_in(password=pwd)
+            except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
+                await bot.send_message(uid, f"❌ {phone}: {e}")
+                await client.disconnect()
+                return False
+
+        # 3. setup
+        async def _logf(t: str):
+            await user_log(uid, f"{phone}: {t}")
+        setup_res = await setup_account(client, uid, _logf)
+        username = setup_res.get("username_set") or ""
+
+        # 4. auto_join_channels
+        await auto_join_channels(client, _logf)
+
+        # 5. Группа
+        groups = await db.db_get_groups_by_owner(uid)
+        groups = groups[:8]
+        rows = []
+        for g in groups:
+            rows.append([(f"📁 {g}", f"acc_grpset:{phone}:{g}")])
+        rows.append([("➕ Новая группа", f"acc_grpnew:{phone}")])
+        rows.append([("❌ Без группы", f"acc_grpset:{phone}:")])
+        rows.append([home_btn()])
+        # сохраняем «черновик» аккаунта
+        _signin_sessions[uid] = {
+            "phone": phone,
+            "proxy": proxy_str,
+            "username": username,
+            "chat_id": chat_id,
+        }
+        await bot.send_message(
+            chat_id,
+            f"✅ <code>{phone}</code> авторизован "
+            f"(@{username or '-'}). Выберите группу:",
+            reply_markup=kb(*rows),
+        )
+        # ждём callback от пользователя — реализован отдельным хендлером
+        await client.disconnect()
+        return True
+    except Exception as e:
+        log.warning("add account %s: %s", phone, e)
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        await bot.send_message(uid, f"❌ {phone}: {e}")
+        return False
+
+
+@dp.callback_query(F.data.startswith("acc_grpset:"))
+async def cb_acc_grpset(cb: CallbackQuery):
+    """callback_data: acc_grpset:<phone>:<group>"""
+    parts = cb.data.split(":", 2)
+    if len(parts) < 3:
+        return await cb.answer("Bad data", show_alert=True)
+    phone = parts[1]
+    grp = parts[2]
+    uid = cb.from_user.id
+    sess = _signin_sessions.get(uid) or {}
+    proxy = sess.get("proxy", "")
+    username = sess.get("username", "")
+    note = ""
+    await db.db_add_account(phone, proxy, note, grp, username, uid)
+    _signin_sessions.pop(uid, None)
+    await cb.message.edit_text(
+        f"✅ <code>{phone}</code> сохранён в группу: "
+        f"<b>{grp or '— без группы —'}</b>"
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("acc_grpnew:"))
+async def cb_acc_grpnew(cb: CallbackQuery):
+    phone = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    await cb.answer()
+    name = await ask_with_cancel(bot, cb.message.chat.id, uid,
+                                 "✏️ Название новой группы:")
+    if not name:
+        return await cb.message.answer("Отменено.")
+    name = name.strip()[:32]
+    sess = _signin_sessions.get(uid) or {}
+    proxy = sess.get("proxy", "")
+    username = sess.get("username", "")
+    await db.db_add_account(phone, proxy, "", name, username, uid)
+    _signin_sessions.pop(uid, None)
+    await cb.message.answer(
+        f"✅ <code>{phone}</code> сохранён в группу: <b>{name}</b>"
+    )
+
+
+# =================================================================
+# ── СЕКЦИЯ: ⚙️ АККАУНТЫ — ИМПОРТ TData ──
+# =================================================================
+# uid -> {"chat_id": int, "group": Optional[str]} — состояние импорта
+_tdata_sessions: Dict[int, Dict[str, Any]] = {}
+
+
+@dp.callback_query(F.data == "acc_tdata")
+async def cb_acc_tdata(cb: CallbackQuery):
+    uid = cb.from_user.id
+    if store.is_busy(uid):
+        return await cb.answer("⏳ Уже идёт другое действие.", show_alert=True)
+    store.set_action(uid, "acc_tdata_wait")
+    _tdata_sessions[uid] = {"chat_id": cb.message.chat.id, "group": ""}
+    await cb.answer()
+    await bot.send_message(
+        cb.message.chat.id,
+        "📦 <b>Импорт TData</b>\n\n"
+        "Пришлите <b>ZIP-архив</b> с папкой/папками <code>tdata</code> от "
+        "Telegram Desktop. Внутри архива может быть несколько tdata — "
+        "каждая будет импортирована как отдельный аккаунт.\n\n"
+        "Папка tdata должна содержать файл <code>key_datas</code> — это "
+        "стандартная структура от Telegram Desktop.\n\n"
+        "После импорта аккаунты появятся в «📱 Мои аккаунты».",
+        reply_markup=kb(
+            [("❌ Отмена", "action_cancel")],
+        ),
+    )
+
+
+@dp.message(F.document)
+async def handle_document(msg: Message):
+    """
+    Принимаем .zip:
+      • если active_action='acc_tdata_wait'    → импорт TData
+      • если active_action='acc_session_wait'  → импорт .session-файлов
+    Иначе игнорируем.
+    """
+    uid = msg.from_user.id
+    mode = store.active_action.get(uid)
+    if mode not in ("acc_tdata_wait", "acc_session_wait"):
+        return
+    sess = _tdata_sessions.get(uid) or {}
+    chat_id = sess.get("chat_id") or msg.chat.id
+
+    doc = msg.document
+    file_name = (doc.file_name or "archive.zip")
+    if not file_name.lower().endswith(".zip"):
+        return await msg.answer("❌ Нужен файл с расширением .zip")
+
+    # Скачиваем
+    work_dir = os.path.join(
+        config.TEMP_DIR,
+        f"{'tdata' if mode == 'acc_tdata_wait' else 'session'}"
+        f"_{uid}_{int(time.time())}",
+    )
+    os.makedirs(work_dir, exist_ok=True)
+    zip_path = os.path.join(work_dir, file_name)
+    try:
+        f = await bot.get_file(doc.file_id)
+        await bot.download_file(f.file_path, destination=zip_path)
+    except Exception as e:
+        store.set_action(uid, None)
+        _tdata_sessions.pop(uid, None)
+        return await msg.answer(f"❌ Не получилось скачать: {e}")
+
+    # Ветка импорта сессий — отдельная функция
+    if mode == "acc_session_wait":
+        await msg.answer("⏳ Архив получен, ищу .session файлы…")
+
+        async def _session_runner():
+            from tdata_import import import_sessions_from_archive
+            try:
+                results = await import_sessions_from_archive(
+                    archive_path=zip_path,
+                    work_dir=work_dir,
+                    sessions_dir=config.SESSIONS_DIR,
+                    api_id=config.API_ID,
+                    api_hash=config.API_HASH,
+                    proxy=None,
+                )
+            except Exception as e:
+                await bot.send_message(uid, f"❌ Импорт сессий упал: {e}")
+                return
+            await _write_session_report(
+                uid, results, "📥 Импорт сессий завершён"
+            )
+            try:
+                import shutil
+                shutil.rmtree(work_dir, ignore_errors=True)
+            except Exception:
+                pass
+            store.set_action(uid, None)
+            _tdata_sessions.pop(uid, None)
+            await restore_main_menu(bot, chat_id, uid)
+
+        await task_queue.submit(
+            _session_runner, owner_id=uid, notify=notify_owner,
+            title="Импорт сессий",
+        )
+        return
+
+    # Дальше — обычный импорт TData
+    await msg.answer("⏳ Архив получен, распаковываю и импортирую…")
+
+    # Запускаем в очереди задач
+    async def _runner():
+        from tdata_import import import_from_archive
+        try:
+            results = await import_from_archive(
+                archive_path=zip_path,
+                work_dir=work_dir,
+                sessions_dir=config.SESSIONS_DIR,
+                proxy=None,
+            )
+        except Exception as e:
+            await bot.send_message(uid, f"❌ Импорт TData упал: {e}")
+            return
+
+        ok_count = 0
+        err_count = 0
+        lines: List[str] = []
+        added_phones: List[str] = []
+        for tdata_folder, phone, err in results:
+            short = os.path.basename(tdata_folder.rstrip(os.sep))
+            if phone and not err:
+                # сохраняем в БД, без прокси, без группы
+                try:
+                    existing = await db.db_get_account(phone)
+                    if existing:
+                        # уже существует — просто перепишем owner_id
+                        await db.db_add_account(
+                            phone, existing.get("proxy") or "",
+                            existing.get("note") or "",
+                            existing.get("grp") or "",
+                            existing.get("username") or "", uid,
+                        )
+                        lines.append(f"♻️ {phone} — обновлён (был в БД)")
+                    else:
+                        await db.db_add_account(
+                            phone, "", "tdata-import", "", "", uid,
+                        )
+                        lines.append(f"✅ {phone} — импортирован")
+                    added_phones.append(phone)
+                    ok_count += 1
+                except Exception as e:
+                    err_count += 1
+                    lines.append(f"❌ {short}: db error {e}")
+            else:
+                err_count += 1
+                lines.append(f"❌ {short}: {err or 'unknown'}")
+
+        # ответ пользователю
+        text = (
+            f"📦 <b>Импорт TData завершён</b>\n"
+            f"Найдено TData: <b>{len(results)}</b>\n"
+            f"✅ Успешно: <b>{ok_count}</b>\n"
+            f"❌ Ошибок: <b>{err_count}</b>\n\n"
+            + "\n".join(lines[:25])
+        )
+        if len(lines) > 25:
+            text += f"\n…ещё {len(lines) - 25} строк"
+        try:
+            await bot.send_message(uid, text)
+        except Exception:
+            pass
+
+        # Чистим work_dir (там распакованный tdata + zip — уже не нужны)
+        try:
+            import shutil
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+        # Возврат в меню
+        store.set_action(uid, None)
+        _tdata_sessions.pop(uid, None)
+        await restore_main_menu(bot, chat_id, uid)
+
+    await task_queue.submit(
+        _runner, owner_id=uid, notify=notify_owner,
+        title="Импорт TData",
+    )
+
+
+# ── Локальный импорт TData по пути на диске (без zip) ──
+@dp.callback_query(F.data == "acc_tdata_local")
+async def cb_acc_tdata_local(cb: CallbackQuery):
+    """
+    Импорт TData из локальной папки на диске. Удобно когда:
+      • архив больше 20 MB (лимит bot api на скачивание),
+      • у тебя уже всё распаковано локально,
+      • папка содержит десятки/сотни tdata.
+    """
+    uid = cb.from_user.id
+    if store.is_busy(uid):
+        return await cb.answer("⏳ Уже идёт другое действие.",
+                               show_alert=True)
+    store.set_action(uid, "acc_tdata_local")
+    await cb.answer()
+    try:
+        path_raw = await ask_with_cancel(
+            bot, cb.message.chat.id, uid,
+            "📂 <b>Импорт TData из локальной папки</b>\n\n"
+            "Пришлите <b>абсолютный путь</b> к папке, в которой лежат "
+            "папки с tdata (имена могут быть любыми — поиск идёт по файлу "
+            "<code>key_datas</code>).\n\n"
+            "Пример Windows:\n"
+            "<code>C:\\Users\\dayhu\\Downloads\\tdata_pack</code>\n\n"
+            "Поддерживаются вложенные структуры — все tdata будут найдены "
+            "рекурсивно.",
+            parse_mode="HTML",
+        )
+        if not path_raw:
+            await restore_main_menu(bot, cb.message.chat.id, uid,
+                                    "Отменено.")
+            return
+        local_path = path_raw.strip().strip('"').strip("'")
+        if not os.path.isdir(local_path):
+            await bot.send_message(
+                uid, f"❌ Папка не найдена: <code>{local_path}</code>"
+            )
+            await restore_main_menu(bot, cb.message.chat.id, uid)
+            return
+
+        # Превью — сколько и какие папки нашли (Q-improvement)
+        from tdata_import import (
+            find_tdata_folders, validate_tdata_structure,
+            import_from_local_folder,
+        )
+        found = find_tdata_folders(local_path)
+        if not found:
+            await bot.send_message(
+                uid,
+                f"📭 В <code>{local_path}</code> не нашлось ни одной "
+                f"tdata (отсутствует файл <code>key_datas</code>)."
+            )
+            await restore_main_menu(bot, cb.message.chat.id, uid)
+            return
+
+        # Прогоним структурную валидацию по каждой найденной папке
+        valid: List[str] = []
+        broken: List[Tuple[str, str]] = []  # (folder, reason)
+        for p in found:
+            v_err = validate_tdata_structure(p)
+            if v_err:
+                broken.append((p, v_err))
+            else:
+                valid.append(p)
+
+        # Покажем список найденных и попросим подтверждение
+        preview_lines = [
+            f"🔎 Найдено TData: <b>{len(found)}</b>",
+            f"   ✅ Годных: <b>{len(valid)}</b>",
+            f"   ❌ Битых: <b>{len(broken)}</b>",
+        ]
+        if valid:
+            preview_lines.append("\n<b>Годные</b> (первые 20):")
+            for p in valid[:20]:
+                short = os.path.relpath(p, local_path) or os.path.basename(p)
+                preview_lines.append(f"  ✅ <code>{short}</code>")
+            if len(valid) > 20:
+                preview_lines.append(f"  …и ещё {len(valid) - 20}")
+        if broken:
+            preview_lines.append("\n<b>Битые</b> (первые 15):")
+            for p, why in broken[:15]:
+                short = os.path.relpath(p, local_path) or os.path.basename(p)
+                preview_lines.append(f"  ❌ <code>{short}</code> — {why}")
+            if len(broken) > 15:
+                preview_lines.append(f"  …и ещё {len(broken) - 15}")
+        # Сохраним путь для подтверждения
+        _tdata_sessions[uid] = {
+            "chat_id": cb.message.chat.id,
+            "local_path": local_path,
+        }
+        await bot.send_message(
+            cb.message.chat.id,
+            "\n".join(preview_lines)
+            + "\n\nИмпортировать всё это?",
+            reply_markup=kb(
+                [("✅ Импортировать", "acc_tdata_local_run")],
+                [("❌ Отмена", "action_cancel")],
+            ),
+        )
+    finally:
+        # set_action не сбрасываем — ждём подтверждения
+        pass
+
+
+@dp.callback_query(F.data == "acc_tdata_local_run")
+async def cb_acc_tdata_local_run(cb: CallbackQuery):
+    uid = cb.from_user.id
+    sess = _tdata_sessions.get(uid) or {}
+    local_path = sess.get("local_path")
+    chat_id = sess.get("chat_id") or cb.message.chat.id
+    if not local_path:
+        store.set_action(uid, None)
+        return await cb.answer("Сессия импорта пропала, начни заново.",
+                               show_alert=True)
+    await cb.answer("⏳ Запускаю импорт…")
+
+    async def _runner():
+        from tdata_import import import_from_local_folder
+        try:
+            results = await import_from_local_folder(
+                root=local_path,
+                sessions_dir=config.SESSIONS_DIR,
+                proxy=None,
+            )
+        except Exception as e:
+            await bot.send_message(uid, f"❌ Импорт TData упал: {e}")
+            return
+
+        ok_count = 0
+        err_count = 0
+        lines: List[str] = []
+        for tdata_folder, phone, err in results:
+            short = os.path.basename(tdata_folder.rstrip(os.sep))
+            if phone and not err:
+                try:
+                    existing = await db.db_get_account(phone)
+                    if existing:
+                        await db.db_add_account(
+                            phone, existing.get("proxy") or "",
+                            existing.get("note") or "",
+                            existing.get("grp") or "",
+                            existing.get("username") or "", uid,
+                        )
+                        lines.append(f"♻️ {phone} — обновлён")
+                    else:
+                        await db.db_add_account(
+                            phone, "", "tdata-import", "", "", uid,
+                        )
+                        lines.append(f"✅ {phone} — импортирован")
+                    ok_count += 1
+                except Exception as e:
+                    err_count += 1
+                    lines.append(f"❌ {short}: db error {e}")
+            else:
+                err_count += 1
+                lines.append(f"❌ {short}: {err or 'unknown'}")
+
+        text = (
+            f"📂 <b>Локальный импорт TData завершён</b>\n"
+            f"Найдено TData: <b>{len(results)}</b>\n"
+            f"✅ Успешно: <b>{ok_count}</b>\n"
+            f"❌ Ошибок: <b>{err_count}</b>\n\n"
+            + "\n".join(lines[:25])
+        )
+        if len(lines) > 25:
+            text += f"\n…ещё {len(lines) - 25} строк"
+        try:
+            await bot.send_message(uid, text)
+        except Exception:
+            pass
+
+        # Локальную папку НЕ удаляем — это пользовательские файлы
+        store.set_action(uid, None)
+        _tdata_sessions.pop(uid, None)
+        await restore_main_menu(bot, chat_id, uid)
+
+    await task_queue.submit(
+        _runner, owner_id=uid, notify=notify_owner,
+        title="Локальный импорт TData",
+    )
+
+
+# =================================================================
+# ── СЕКЦИЯ: ⚙️ АККАУНТЫ — ИМПОРТ .SESSION (Telethon) ──
+# =================================================================
+# ZIP-вариант — присылаем архив с .session файлами в чат.
+@dp.callback_query(F.data == "acc_session_zip")
+async def cb_acc_session_zip(cb: CallbackQuery):
+    uid = cb.from_user.id
+    if store.is_busy(uid):
+        return await cb.answer("⏳ Уже идёт другое действие.", show_alert=True)
+    store.set_action(uid, "acc_session_wait")
+    _tdata_sessions[uid] = {"chat_id": cb.message.chat.id}
+    await cb.answer()
+    await bot.send_message(
+        cb.message.chat.id,
+        "📥 <b>Импорт .session файлов (ZIP)</b>\n\n"
+        "Пришлите ZIP-архив с одним или несколькими файлами "
+        "<code>*.session</code> от Telethon. Папка/имена внутри — "
+        "произвольные.\n\n"
+        "Каждый .session — это уже готовая авторизация: ничего не "
+        "конвертируется, бот просто проверит её валидность и добавит "
+        "аккаунт в БД под номером, который вернёт Telegram.",
+        reply_markup=kb([("❌ Отмена", "action_cancel")]),
+    )
+
+
+# Локальный вариант — указать путь к папке.
+@dp.callback_query(F.data == "acc_session_local")
+async def cb_acc_session_local(cb: CallbackQuery):
+    uid = cb.from_user.id
+    if store.is_busy(uid):
+        return await cb.answer("⏳ Уже идёт другое действие.",
+                               show_alert=True)
+    store.set_action(uid, "acc_session_local")
+    await cb.answer()
+    try:
+        path_raw = await ask_with_cancel(
+            bot, cb.message.chat.id, uid,
+            "📥 <b>Импорт .session файлов (локальная папка)</b>\n\n"
+            "Пришлите абсолютный путь к папке, где лежат "
+            "<code>*.session</code> файлы (рекурсивно). Имена файлов "
+            "и подпапок — любые.\n\n"
+            "Пример: <code>C:\\Users\\dayhu\\Downloads\\sessions_pack</code>",
+            parse_mode="HTML",
+        )
+        if not path_raw:
+            await restore_main_menu(bot, cb.message.chat.id, uid,
+                                    "Отменено.")
+            return
+        local_path = path_raw.strip().strip('"').strip("'")
+        if not os.path.isdir(local_path):
+            await bot.send_message(
+                uid, f"❌ Папка не найдена: <code>{local_path}</code>"
+            )
+            await restore_main_menu(bot, cb.message.chat.id, uid)
+            return
+
+        # Превью
+        from tdata_import import find_session_files
+        files = find_session_files(local_path)
+        if not files:
+            await bot.send_message(
+                uid,
+                f"📭 В <code>{local_path}</code> не нашлось *.session "
+                f"файлов."
+            )
+            await restore_main_menu(bot, cb.message.chat.id, uid)
+            return
+
+        preview_lines = [
+            f"🔎 Найдено .session: <b>{len(files)}</b>",
+            "Список (первые 30):",
+        ]
+        for p in files[:30]:
+            short = os.path.relpath(p, local_path) or os.path.basename(p)
+            preview_lines.append(f"  • <code>{short}</code>")
+        if len(files) > 30:
+            preview_lines.append(f"  …и ещё {len(files) - 30}")
+
+        _tdata_sessions[uid] = {
+            "chat_id": cb.message.chat.id,
+            "local_path": local_path,
+        }
+        await bot.send_message(
+            cb.message.chat.id,
+            "\n".join(preview_lines)
+            + "\n\nИмпортировать?",
+            reply_markup=kb(
+                [("✅ Импортировать", "acc_session_local_run")],
+                [("❌ Отмена", "action_cancel")],
+            ),
+        )
+    finally:
+        pass
+
+
+@dp.callback_query(F.data == "acc_session_local_run")
+async def cb_acc_session_local_run(cb: CallbackQuery):
+    uid = cb.from_user.id
+    sess = _tdata_sessions.get(uid) or {}
+    local_path = sess.get("local_path")
+    chat_id = sess.get("chat_id") or cb.message.chat.id
+    if not local_path:
+        store.set_action(uid, None)
+        return await cb.answer("Сессия импорта пропала.", show_alert=True)
+    await cb.answer("⏳ Запускаю…")
+
+    async def _runner():
+        from tdata_import import import_sessions_from_folder
+        try:
+            results = await import_sessions_from_folder(
+                root=local_path,
+                sessions_dir=config.SESSIONS_DIR,
+                api_id=config.API_ID,
+                api_hash=config.API_HASH,
+                proxy=None,
+            )
+        except Exception as e:
+            await bot.send_message(uid, f"❌ Импорт упал: {e}")
+            return
+        await _write_session_report(uid, results, "📥 Локальный импорт сессий")
+        store.set_action(uid, None)
+        _tdata_sessions.pop(uid, None)
+        await restore_main_menu(bot, chat_id, uid)
+
+    await task_queue.submit(
+        _runner, owner_id=uid, notify=notify_owner,
+        title="Локальный импорт сессий",
+    )
+
+
+async def _write_session_report(uid: int,
+                                results: List[Tuple[str, Optional[str], Optional[str]]],
+                                title: str) -> None:
+    """Общий отчёт-формат для импорта сессий (ZIP/локальный)."""
+    ok_count = 0
+    err_count = 0
+    lines: List[str] = []
+    for src, phone, err in results:
+        short = os.path.basename(src)
+        if phone and not err:
+            try:
+                existing = await db.db_get_account(phone)
+                if existing:
+                    await db.db_add_account(
+                        phone, existing.get("proxy") or "",
+                        existing.get("note") or "",
+                        existing.get("grp") or "",
+                        existing.get("username") or "", uid,
+                    )
+                    lines.append(f"♻️ {phone} — обновлён")
+                else:
+                    await db.db_add_account(
+                        phone, "", "session-import", "", "", uid,
+                    )
+                    lines.append(f"✅ {phone} — импортирован")
+                ok_count += 1
+            except Exception as e:
+                err_count += 1
+                lines.append(f"❌ {short}: db error {e}")
+        else:
+            err_count += 1
+            lines.append(f"❌ {short}: {err or 'unknown'}")
+
+    text = (
+        f"{title}\n"
+        f"Найдено сессий: <b>{len(results)}</b>\n"
+        f"✅ Успешно: <b>{ok_count}</b>\n"
+        f"❌ Ошибок: <b>{err_count}</b>\n\n"
+        + "\n".join(lines[:25])
+    )
+    if len(lines) > 25:
+        text += f"\n…ещё {len(lines) - 25} строк"
+    try:
+        await bot.send_message(uid, text)
+    except Exception:
+        pass
+
+
+# =================================================================
+# ── СЕКЦИЯ: ⚙️ АККАУНТЫ — СПИСОК (с пагинацией) ──
+# =================================================================
+@dp.callback_query(F.data.startswith("acc_list:"))
+async def cb_acc_list(cb: CallbackQuery):
+    uid = cb.from_user.id
+    try:
+        page = int(cb.data.split(":", 1)[1])
+    except Exception:
+        page = 0
+    accs = await db.db_get_accounts_by_owner(uid)
+    per = config.ACCOUNTS_PER_PAGE
+    total = len(accs)
+    pages = max(1, (total + per - 1) // per)
+    page = max(0, min(page, pages - 1))
+    chunk = accs[page * per:(page + 1) * per]
+
+    rows = []
+    for a in chunk:
+        ph = a["phone"]
+        un = a.get("username") or "-"
+        nt = (a.get("note") or "")[:24]
+        rows.append([
+            (f"📱 {ph} (@{un})" + (f" — {nt}" if nt else ""),
+             f"acc_card:{ph}")
+        ])
+    nav = []
+    if page > 0:
+        nav.append(("◀️", f"acc_list:{page-1}"))
+    nav.append((f"{page+1}/{pages}", "noop"))
+    if page < pages - 1:
+        nav.append(("▶️", f"acc_list:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([("♻️ Сбросить все сессии", "acc_reset_all")])
+    rows.append([home_btn()])
+    text = (f"📱 <b>Мои аккаунты</b>: {total} шт.\n"
+            f"Страница {page+1}/{pages}")
+    try:
+        await cb.message.edit_text(text, reply_markup=kb(*rows))
+    except TelegramBadRequest:
+        await cb.message.answer(text, reply_markup=kb(*rows))
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "noop")
+async def cb_noop(cb: CallbackQuery):
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "acc_reset_all")
+async def cb_acc_reset_all(cb: CallbackQuery):
+    uid = cb.from_user.id
+    await cb.answer()
+    confirm = await ask_with_cancel(
+        bot, cb.message.chat.id, uid,
+        "⚠️ Удалить ВСЕ сессии и аккаунты? Напишите <b>ДА</b>.",
+        parse_mode="HTML",
+    )
+    if not confirm or confirm.strip().lower() != "да":
+        return await cb.message.answer("Отменено.")
+    accs = await db.db_get_accounts_by_owner(uid)
+    n = 0
+    for a in accs:
+        try:
+            await db.db_delete_account(a["phone"])
+            sp = os.path.join(config.SESSIONS_DIR, a["phone"] + ".session")
+            try:
+                os.remove(sp)
+            except Exception:
+                pass
+            n += 1
+        except Exception:
+            pass
+    await cb.message.answer(f"♻️ Удалено: {n} аккаунтов.")
+
+
+# =================================================================
+# ── СЕКЦИЯ: ⚙️ АККАУНТЫ — КАРТОЧКА ──
+# =================================================================
+async def _render_account_card(phone: str, owner_id: int):
+    a = await db.db_get_account(phone)
+    if not a or a.get("owner_id") != owner_id:
+        return None, None
+    ar_settings = await db.db_ar_get_settings(owner_id, phone)
+    ar_on = bool(ar_settings.get("enabled"))
+
+    # Q11 (C): если у аккаунта пусто в proxy — посмотрим, какой sticky-глобал
+    # ему достанется на лету; покажем «(через глобал) host».
+    own_proxy = (a.get("proxy") or "").strip()
+    if own_proxy:
+        proxy_line = own_proxy
+    else:
+        gp = await get_sticky_global_proxy(phone)
+        if gp:
+            host = proxy_host(gp["proxy_str"]) or "?"
+            proxy_line = f"<i>(через глобал)</i> {host}"
+        else:
+            proxy_line = "— без прокси —"
+
+    text = (
+        f"📱 <code>{a['phone']}</code> (@{a.get('username') or '-'})\n"
+        f"📝 {a.get('note') or '—'}\n"
+        f"📁 {a.get('grp') or '—'}\n"
+        f"🛡 {proxy_line}\n"
+        f"💬 Автоответ: {'✅' if ar_on else '❌'}"
+    )
+    rows = [
+        [("✏️ Заметка", f"acc_note:{phone}"),
+         ("🔄 Группа", f"acc_grp:{phone}")],
+        [("✏️ Имя", f"acc_name:{phone}"),
+         ("✏️ Био", f"acc_bio:{phone}")],
+        [("📷 Фото", f"acc_photo:{phone}"),
+         ("✏️ Username", f"acc_uname:{phone}")],
+        [("🔒 Приватность", f"acc_priv:{phone}")],
+        [("📨 Получить код", f"acc_code:{phone}")],
+        [("🗑 Удалить", f"acc_del:{phone}")],
+        [("‹ Назад", "acc_list:0"), home_btn()],
+    ]
+    return text, kb(*rows)
+
+
+@dp.callback_query(F.data.startswith("acc_card:"))
+async def cb_acc_card(cb: CallbackQuery):
+    phone = cb.data.split(":", 1)[1]
+    text, mk = await _render_account_card(phone, cb.from_user.id)
+    if not text:
+        return await cb.answer("Аккаунт не найден.", show_alert=True)
+    try:
+        await cb.message.edit_text(text, reply_markup=mk)
+    except TelegramBadRequest:
+        await cb.message.answer(text, reply_markup=mk)
+    await cb.answer()
+
+
+# ─── Заметка ───
+@dp.callback_query(F.data.startswith("acc_note:"))
+async def cb_acc_note(cb: CallbackQuery):
+    phone = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    await cb.answer()
+    text = await ask_with_cancel(
+        bot, cb.message.chat.id, uid,
+        f"✏️ Новая заметка для <code>{phone}</code>:"
+    )
+    if text is None:
+        return
+    await db.db_update_account_field(phone, "note", text.strip()[:256])
+    await cb.message.answer("✅ Заметка обновлена.")
+
+
+# ─── Группа ───
+@dp.callback_query(F.data.startswith("acc_grp:"))
+async def cb_acc_grp(cb: CallbackQuery):
+    phone = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    await cb.answer()
+    groups = (await db.db_get_groups_by_owner(uid))[:8]
+    rows = [[(f"📁 {g}", f"acc_grpset2:{phone}:{g}")] for g in groups]
+    rows.append([("➕ Новая группа", f"acc_grpnew2:{phone}")])
+    rows.append([("❌ Без группы", f"acc_grpset2:{phone}:")])
+    rows.append([("‹ Назад", f"acc_card:{phone}")])
+    await cb.message.answer(
+        f"📁 Выберите группу для <code>{phone}</code>:",
+        reply_markup=kb(*rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("acc_grpset2:"))
+async def cb_acc_grpset2(cb: CallbackQuery):
+    parts = cb.data.split(":", 2)
+    phone = parts[1]
+    grp = parts[2] if len(parts) > 2 else ""
+    await db.db_update_account_field(phone, "grp", grp)
+    await cb.answer("Группа обновлена.")
+    text, mk = await _render_account_card(phone, cb.from_user.id)
+    if text:
+        try:
+            await cb.message.edit_text(text, reply_markup=mk)
+        except TelegramBadRequest:
+            await cb.message.answer(text, reply_markup=mk)
+
+
+@dp.callback_query(F.data.startswith("acc_grpnew2:"))
+async def cb_acc_grpnew2(cb: CallbackQuery):
+    phone = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    await cb.answer()
+    name = await ask_with_cancel(bot, cb.message.chat.id, uid,
+                                 "✏️ Название новой группы:")
+    if not name:
+        return
+    await db.db_update_account_field(phone, "grp", name.strip()[:32])
+    text, mk = await _render_account_card(phone, uid)
+    if text:
+        await cb.message.answer(text, reply_markup=mk)
+
+
+# ─── Имя ───
+@dp.callback_query(F.data.startswith("acc_name:"))
+async def cb_acc_name(cb: CallbackQuery):
+    phone = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    await cb.answer()
+    new_name = await ask_with_cancel(
+        bot, cb.message.chat.id, uid,
+        f"✏️ Новое имя (first_name) для <code>{phone}</code>:"
+    )
+    if not new_name:
+        return
+    cli = await get_or_create_account_client(phone, uid)
+    if not cli:
+        return await cb.message.answer("❌ Не удалось подключиться.")
+    try:
+        await cli(UpdateProfileRequest(first_name=new_name.strip()[:64]))
+        await cb.message.answer("✅ Имя обновлено.")
+    except Exception as e:
+        await cb.message.answer(f"❌ {e}")
+
+
+# ─── Био ───
+@dp.callback_query(F.data.startswith("acc_bio:"))
+async def cb_acc_bio(cb: CallbackQuery):
+    phone = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    await cb.answer()
+    bio = await ask_with_cancel(
+        bot, cb.message.chat.id, uid,
+        f"✏️ Новое био для <code>{phone}</code> (до 70 симв.):"
+    )
+    if bio is None:
+        return
+    cli = await get_or_create_account_client(phone, uid)
+    if not cli:
+        return await cb.message.answer("❌ Не удалось подключиться.")
+    try:
+        await cli(UpdateProfileRequest(about=bio.strip()[:70]))
+        await cb.message.answer("✅ Био обновлено.")
+    except Exception as e:
+        await cb.message.answer(f"❌ {e}")
+
+
+# ─── Фото ───
+@dp.callback_query(F.data.startswith("acc_photo:"))
+async def cb_acc_photo(cb: CallbackQuery):
+    phone = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    await cb.answer()
+    # включить сборщик и попросить фото
+    store.photo_collecting[uid] = True
+    store.clear_temp_photos(uid)
+    await bot.send_message(
+        cb.message.chat.id,
+        f"📷 Пришлите ОДНО фото для <code>{phone}</code>.\n"
+        f"После — нажмите «Готово».",
+        reply_markup=kb([("✅ Готово", f"acc_photodone:{phone}")],
+                        [("❌ Отмена", "action_cancel")]),
+    )
+
+
+@dp.callback_query(F.data.startswith("acc_photodone:"))
+async def cb_acc_photodone(cb: CallbackQuery):
+    phone = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    photos = store.get_temp_photos(uid)
+    store.photo_collecting[uid] = False
+    store.clear_temp_photos(uid)
+    await cb.answer()
+    if not photos:
+        return await cb.message.answer("⚠️ Фото не получено.")
+    cli = await get_or_create_account_client(phone, uid)
+    if not cli:
+        return await cb.message.answer("❌ Не удалось подключиться.")
+    try:
+        # Удалим текущие фото профиля
+        try:
+            existing = await cli(GetUserPhotosRequest(
+                user_id="me", offset=0, max_id=0, limit=10))
+            input_photos = []
+            for p in existing.photos:
+                input_photos.append(InputPhoto(id=p.id, access_hash=p.access_hash,
+                                               file_reference=p.file_reference))
+            if input_photos:
+                await cli(DeletePhotosRequest(id=input_photos))
+        except Exception:
+            pass
+        await cli(UploadProfilePhotoRequest(
+            file=await cli.upload_file(photos[0])
+        ))
+        await cb.message.answer("✅ Фото профиля обновлено.")
+    except Exception as e:
+        await cb.message.answer(f"❌ {e}")
+
+
+# ─── Username ───
+@dp.callback_query(F.data.startswith("acc_uname:"))
+async def cb_acc_uname(cb: CallbackQuery):
+    phone = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    await cb.answer()
+    new_un = await ask_with_cancel(
+        bot, cb.message.chat.id, uid,
+        f"✏️ Новый username для <code>{phone}</code> (без @):"
+    )
+    if not new_un:
+        return
+    new_un = new_un.strip().lstrip("@")
+    cli = await get_or_create_account_client(phone, uid)
+    if not cli:
+        return await cb.message.answer("❌ Не удалось подключиться.")
+    try:
+        from telethon.tl.functions.account import UpdateUsernameRequest
+        await cli(UpdateUsernameRequest(username=new_un))
+        await db.db_update_account_field(phone, "username", new_un)
+        await cb.message.answer(f"✅ Username @{new_un}.")
+    except Exception as e:
+        await cb.message.answer(f"❌ {e}")
+
+
+# ─── Приватность ───
+@dp.callback_query(F.data.startswith("acc_priv:"))
+async def cb_acc_priv(cb: CallbackQuery):
+    phone = cb.data.split(":", 1)[1]
+    await cb.answer()
+    await cb.message.answer(
+        f"🔒 Приватность для <code>{phone}</code>:",
+        reply_markup=kb(
+            [("🔒 Закрыть всё", f"acc_privset:{phone}:close")],
+            [("🔓 Открыть всё", f"acc_privset:{phone}:open")],
+            [("‹ Назад", f"acc_card:{phone}")],
+        ),
+    )
+
+
+@dp.callback_query(F.data.startswith("acc_privset:"))
+async def cb_acc_privset(cb: CallbackQuery):
+    parts = cb.data.split(":", 2)
+    phone, mode = parts[1], parts[2]
+    uid = cb.from_user.id
+    cli = await get_or_create_account_client(phone, uid)
+    if not cli:
+        return await cb.answer("❌ Не подключились.", show_alert=True)
+    from telethon.tl.functions.account import SetPrivacyRequest
+    from telethon.tl.types import (
+        InputPrivacyValueAllowAll, InputPrivacyValueDisallowAll,
+        InputPrivacyKeyStatusTimestamp, InputPrivacyKeyProfilePhoto,
+        InputPrivacyKeyForwards, InputPrivacyKeyPhoneCall,
+        InputPrivacyKeyVoiceMessages, InputPrivacyKeyPhoneNumber,
+        InputPrivacyKeyChatInvite,
+    )
+    keys = [
+        InputPrivacyKeyStatusTimestamp(), InputPrivacyKeyProfilePhoto(),
+        InputPrivacyKeyForwards(), InputPrivacyKeyPhoneCall(),
+        InputPrivacyKeyVoiceMessages(), InputPrivacyKeyPhoneNumber(),
+        InputPrivacyKeyChatInvite(),
+    ]
+    rule = (InputPrivacyValueDisallowAll() if mode == "close"
+            else InputPrivacyValueAllowAll())
+    errs = 0
+    for k in keys:
+        try:
+            await cli(SetPrivacyRequest(key=k, rules=[rule]))
+        except Exception:
+            errs += 1
+    await cb.answer(
+        ("Закрыто" if mode == "close" else "Открыто")
+        + (f" ({errs} ошибок)" if errs else ""),
+    )
+
+
+# ─── Получить код ───
+@dp.callback_query(F.data.startswith("acc_code:"))
+async def cb_acc_code(cb: CallbackQuery):
+    phone = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    cli = await get_or_create_account_client(phone, uid)
+    if not cli:
+        return await cb.answer("❌ Не подключились.", show_alert=True)
+    found = None
+    try:
+        for sender in (777000, 42777):
+            try:
+                msgs = await cli.get_messages(sender, limit=1)
+                if msgs:
+                    found = msgs[0]
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
+    await cb.answer()
+    if not found:
+        return await cb.message.answer("📭 Сообщений от Telegram не найдено.")
+    text = found.text or found.message or ""
+    await cb.message.answer(
+        f"📨 <b>Последнее от Telegram:</b>\n<code>{text[:1000]}</code>"
+    )
+
+
+# ─── Удалить аккаунт ───
+@dp.callback_query(F.data.startswith("acc_del:"))
+async def cb_acc_del(cb: CallbackQuery):
+    phone = cb.data.split(":", 1)[1]
+    await cb.answer()
+    await cb.message.answer(
+        f"⚠️ Удалить <code>{phone}</code>? Все задачи и сессия будут стёрты.",
+        reply_markup=kb(
+            [("✅ Да, удалить", f"acc_del2:{phone}")],
+            [("‹ Отмена", f"acc_card:{phone}")],
+        ),
+    )
+
+
+@dp.callback_query(F.data.startswith("acc_del2:"))
+async def cb_acc_del2(cb: CallbackQuery):
+    phone = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    # стопнуть автоответ, если включён
+    try:
+        await ar_manager.stop(phone)
+    except Exception:
+        pass
+    # стопнуть xo_liking
+    t = store.xo_liking_tasks.pop(phone, None)
+    if t and not t.done():
+        t.cancel()
+    # отметить как cancelled для LDV
+    store.cancelled_phones.add(phone)
+    # удалить из кеша клиентов
+    cli = _account_clients.pop(phone, None)
+    if cli:
+        try:
+            await cli.disconnect()
+        except Exception:
+            pass
+    # удалить из БД
+    await db.db_delete_account(phone)
+    # стереть .session
+    sp = os.path.join(config.SESSIONS_DIR, phone + ".session")
+    try:
+        os.remove(sp)
+    except Exception:
+        pass
+    await cb.answer("Удалён.")
+    await cb.message.edit_text(f"🗑 <code>{phone}</code> удалён.")
+
+
+# =================================================================
+# ── СЕКЦИЯ: 🔑 ПРОКСИ ──
+# =================================================================
+@dp.callback_query(F.data == "px_list")
+async def cb_px_list(cb: CallbackQuery):
+    uid = cb.from_user.id
+    proxies = await db.db_proxy_get_by_owner(uid)
+    if not proxies:
+        text = "🔑 У вас нет прокси."
+    else:
+        lines = ["🔑 <b>Мои прокси</b>:"]
+        for p in proxies:
+            mark = ("✅" if p.get("status") == "alive"
+                    else "❌" if p.get("status") == "dead" else "❓")
+            lines.append(
+                f"{mark} #{p['id']} — <code>{p['proxy_str']}</code>"
+                + (f" — {p['note']}" if p.get('note') else "")
+            )
+        text = "\n".join(lines)
+
+    rows = []
+    for p in proxies[:20]:
+        mark = ("✅" if p.get("status") == "alive"
+                else "❌" if p.get("status") == "dead" else "❓")
+        rows.append([(f"{mark} #{p['id']}", f"px_view:{p['id']}")])
+    rows.append([("➕ Добавить", "px_add"),
+                 ("🔍 Проверить все", "px_checkall")])
+    rows.append([("📡 Назначить на аккаунты", "px_reassign")])
+    rows.append([("🌐 Глобальные", "gpx_list")])
+    rows.append([home_btn()])
+    try:
+        await cb.message.edit_text(text, reply_markup=kb(*rows))
+    except TelegramBadRequest:
+        await cb.message.answer(text, reply_markup=kb(*rows))
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "px_add")
+async def cb_px_add(cb: CallbackQuery):
+    uid = cb.from_user.id
+    await cb.answer()
+    raw = await ask_with_cancel(
+        bot, cb.message.chat.id, uid,
+        "🔑 Пришлите прокси (host:port:user:pass).\n"
+        "Можно несколько строк.",
+    )
+    if raw is None:
+        return
+    added = 0
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if not parse_proxy_string(line):
+            continue
+        await db.db_proxy_add(uid, line, "")
+        added += 1
+    await cb.message.answer(f"✅ Добавлено: {added}")
+
+
+@dp.callback_query(F.data == "px_checkall")
+async def cb_px_checkall(cb: CallbackQuery):
+    uid = cb.from_user.id
+    proxies = await db.db_proxy_get_by_owner(uid)
+    await cb.answer(f"Проверяю {len(proxies)}…")
+    alive = 0
+    for p in proxies:
+        ok = await check_proxy_connection(p["proxy_str"])
+        await db.db_proxy_update_status(p["id"], "alive" if ok else "dead")
+        if ok:
+            alive += 1
+    await cb.message.answer(
+        f"🔍 Проверено: {len(proxies)}\n✅ Живых: {alive}\n❌ Мёртвых: "
+        f"{len(proxies) - alive}"
+    )
+
+
+@dp.callback_query(F.data == "px_reassign")
+async def cb_px_reassign(cb: CallbackQuery):
+    uid = cb.from_user.id
+    res = await reassign_phones(uid)
+    await cb.answer()
+    await cb.message.answer(
+        f"📡 Прокси назначены: обновлено <b>{res['updated']}</b>, "
+        f"без прокси осталось <b>{res['skipped']}</b>."
+    )
+
+
+@dp.callback_query(F.data.startswith("px_view:"))
+async def cb_px_view(cb: CallbackQuery):
+    pid = int(cb.data.split(":", 1)[1])
+    p = await db.db_proxy_get_by_id(pid)
+    if not p or p["owner_id"] != cb.from_user.id:
+        return await cb.answer("Не найдено.", show_alert=True)
+    mark = ("✅" if p["status"] == "alive"
+            else "❌" if p["status"] == "dead" else "❓")
+    text = (
+        f"🔑 Прокси #{pid}\n"
+        f"<code>{p['proxy_str']}</code>\n"
+        f"Статус: {mark} {p['status']}\n"
+        f"Заметка: {p.get('note') or '—'}"
+    )
+    await cb.message.edit_text(
+        text,
+        reply_markup=kb(
+            [("🔍 Проверить", f"px_check:{pid}")],
+            [("✏️ Заметка", f"px_note:{pid}")],
+            [("🗑 Удалить", f"px_del:{pid}")],
+            [("‹ Назад", "px_list")],
+        ),
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("px_check:"))
+async def cb_px_check(cb: CallbackQuery):
+    pid = int(cb.data.split(":", 1)[1])
+    p = await db.db_proxy_get_by_id(pid)
+    if not p:
+        return await cb.answer("Не найдено.", show_alert=True)
+    ok = await check_proxy_connection(p["proxy_str"])
+    await db.db_proxy_update_status(pid, "alive" if ok else "dead")
+    await cb.answer("✅ Жив" if ok else "❌ Мёртв")
+    await cb_px_view(cb)
+
+
+@dp.callback_query(F.data.startswith("px_note:"))
+async def cb_px_note(cb: CallbackQuery):
+    pid = int(cb.data.split(":", 1)[1])
+    uid = cb.from_user.id
+    await cb.answer()
+    txt = await ask_with_cancel(bot, cb.message.chat.id, uid,
+                                f"✏️ Заметка для прокси #{pid}:")
+    if txt is None:
+        return
+    await db.db_proxy_update_note(pid, txt.strip()[:128])
+    await cb.message.answer("✅ Заметка обновлена.")
+
+
+@dp.callback_query(F.data.startswith("px_del:"))
+async def cb_px_del(cb: CallbackQuery):
+    pid = int(cb.data.split(":", 1)[1])
+    await db.db_proxy_delete(pid)
+    await cb.answer("Удалён.")
+    await cb_px_list(cb)
+
+
+# =================================================================
+# ── СЕКЦИЯ: 🌐 ГЛОБАЛЬНЫЕ ПРОКСИ ──
+# CRUD для админов, read-only с маскировкой для остальных.
+# =================================================================
+def _gpx_render_row(g: Dict[str, Any], is_admin: bool) -> str:
+    mark = ("✅" if g.get("status") == "alive"
+            else "❌" if g.get("status") == "dead" else "❓")
+    if is_admin:
+        body = f"<code>{g['proxy_str']}</code>"
+    else:
+        body = f"<code>{mask_proxy(g['proxy_str'])}</code>"
+    note = (f" — {g['note']}" if g.get("note") else "")
+    return f"{mark} #{g['id']} — {body}{note}"
+
+
+@dp.callback_query(F.data == "gpx_list")
+async def cb_gpx_list(cb: CallbackQuery):
+    uid = cb.from_user.id
+    is_admin = await db.db_admins_check(uid)
+    globs = await db.db_gproxy_get_all()
+    if not globs:
+        text = "🌐 <b>Глобальные прокси</b>\n— пусто —"
+    else:
+        lines = ["🌐 <b>Глобальные прокси</b>:"]
+        for g in globs:
+            lines.append(_gpx_render_row(g, is_admin))
+        if not is_admin:
+            lines.append(
+                "\n<i>(read-only — управление доступно только админам)</i>"
+            )
+        text = "\n".join(lines)
+
+    rows = []
+    for g in globs[:20]:
+        mark = ("✅" if g.get("status") == "alive"
+                else "❌" if g.get("status") == "dead" else "❓")
+        rows.append([(f"{mark} #{g['id']}", f"gpx_view:{g['id']}")])
+    if is_admin:
+        rows.append([("➕ Добавить", "gpx_add"),
+                     ("🔍 Проверить все", "gpx_checkall")])
+    rows.append([("‹ Назад", "px_list"), home_btn()])
+    try:
+        await cb.message.edit_text(text, reply_markup=kb(*rows))
+    except TelegramBadRequest:
+        await cb.message.answer(text, reply_markup=kb(*rows))
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "gpx_add")
+async def cb_gpx_add(cb: CallbackQuery):
+    uid = cb.from_user.id
+    if not await db.db_admins_check(uid):
+        return await cb.answer("⛔ Только админ.", show_alert=True)
+    await cb.answer()
+    raw = await ask_with_cancel(
+        bot, cb.message.chat.id, uid,
+        "🌐 Пришлите глобальные прокси (host:port:user:pass).\n"
+        "Можно несколько строк. Дубликаты будут проигнорированы.",
+    )
+    if raw is None:
+        return
+    added = 0
+    skipped_dup = 0
+    skipped_bad = 0
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if not parse_proxy_string(line):
+            skipped_bad += 1
+            continue
+        new_id = await db.db_gproxy_add(line, "")
+        if new_id is None:
+            skipped_dup += 1
+        else:
+            added += 1
+    text = f"✅ Добавлено: <b>{added}</b>"
+    if skipped_dup:
+        text += f"\n♻️ Дубликатов пропущено: {skipped_dup}"
+    if skipped_bad:
+        text += f"\n❌ Невалидных строк: {skipped_bad}"
+    await cb.message.answer(text)
+
+
+@dp.callback_query(F.data == "gpx_checkall")
+async def cb_gpx_checkall(cb: CallbackQuery):
+    uid = cb.from_user.id
+    if not await db.db_admins_check(uid):
+        return await cb.answer("⛔ Только админ.", show_alert=True)
+    globs = await db.db_gproxy_get_all()
+    await cb.answer(f"Проверяю {len(globs)}…")
+    alive = 0
+    for g in globs:
+        ok = await check_proxy_connection(g["proxy_str"])
+        await db.db_gproxy_update_status(g["id"], "alive" if ok else "dead")
+        if ok:
+            alive += 1
+    await cb.message.answer(
+        f"🔍 Проверено: {len(globs)}\n"
+        f"✅ Живых: {alive}\n"
+        f"❌ Мёртвых: {len(globs) - alive}"
+    )
+
+
+@dp.callback_query(F.data.startswith("gpx_view:"))
+async def cb_gpx_view(cb: CallbackQuery):
+    uid = cb.from_user.id
+    is_admin = await db.db_admins_check(uid)
+    pid = int(cb.data.split(":", 1)[1])
+    g = await db.db_gproxy_get_by_id(pid)
+    if not g:
+        return await cb.answer("Не найдено.", show_alert=True)
+    mark = ("✅" if g["status"] == "alive"
+            else "❌" if g["status"] == "dead" else "❓")
+    body = (g['proxy_str'] if is_admin else mask_proxy(g['proxy_str']))
+    text = (
+        f"🌐 Глобал #{pid}\n"
+        f"<code>{body}</code>\n"
+        f"Статус: {mark} {g['status']}\n"
+        f"Заметка: {g.get('note') or '—'}"
+    )
+    rows: List[List[Tuple[str, str]]] = []
+    if is_admin:
+        rows.append([("🔍 Проверить", f"gpx_check:{pid}")])
+        rows.append([("✏️ Заметка", f"gpx_note:{pid}")])
+        rows.append([("🗑 Удалить", f"gpx_del:{pid}")])
+    rows.append([("‹ Назад", "gpx_list")])
+    try:
+        await cb.message.edit_text(text, reply_markup=kb(*rows))
+    except TelegramBadRequest:
+        await cb.message.answer(text, reply_markup=kb(*rows))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("gpx_check:"))
+async def cb_gpx_check(cb: CallbackQuery):
+    if not await db.db_admins_check(cb.from_user.id):
+        return await cb.answer("⛔ Только админ.", show_alert=True)
+    pid = int(cb.data.split(":", 1)[1])
+    g = await db.db_gproxy_get_by_id(pid)
+    if not g:
+        return await cb.answer("Не найдено.", show_alert=True)
+    ok = await check_proxy_connection(g["proxy_str"])
+    await db.db_gproxy_update_status(pid, "alive" if ok else "dead")
+    await cb.answer("✅ Жив" if ok else "❌ Мёртв")
+    await cb_gpx_view(cb)
+
+
+@dp.callback_query(F.data.startswith("gpx_note:"))
+async def cb_gpx_note(cb: CallbackQuery):
+    uid = cb.from_user.id
+    if not await db.db_admins_check(uid):
+        return await cb.answer("⛔ Только админ.", show_alert=True)
+    pid = int(cb.data.split(":", 1)[1])
+    await cb.answer()
+    txt = await ask_with_cancel(
+        bot, cb.message.chat.id, uid,
+        f"✏️ Заметка для глобал-прокси #{pid}:"
+    )
+    if txt is None:
+        return
+    await db.db_gproxy_update_note(pid, txt.strip()[:128])
+    await cb.message.answer("✅ Заметка обновлена.")
+
+
+@dp.callback_query(F.data.startswith("gpx_del:"))
+async def cb_gpx_del(cb: CallbackQuery):
+    if not await db.db_admins_check(cb.from_user.id):
+        return await cb.answer("⛔ Только админ.", show_alert=True)
+    pid = int(cb.data.split(":", 1)[1])
+    await db.db_gproxy_delete(pid)
+    await cb.answer("Удалён.")
+    await cb_gpx_list(cb)
+
+
+# =================================================================
+# ── СЕКЦИЯ: 🤖 АВТОМАТИЗАЦИЯ — ОБЩИЕ HELPER-Ы ──
+# =================================================================
+# Хранилище списка групп (по uid) для коротких callback'ов «по индексу».
+_grp_index_cache: Dict[int, List[str]] = {}
+
+
+async def _send_target_picker(chat_id: int, prefix: str, title: str):
+    """
+    Показать инлайн-меню выбора целей: [Все] [Группа] [Вручную].
+    prefix используется в callback_data: <prefix>:all / <prefix>:grp /
+    <prefix>:man.
+    """
+    await bot.send_message(
+        chat_id, title,
+        reply_markup=kb(
+            [("Все", f"{prefix}:all"),
+             ("Группа", f"{prefix}:grp"),
+             ("Вручную", f"{prefix}:man")],
+            [home_btn()],
+        ),
+    )
+
+
+async def _send_groups_picker(uid: int, chat_id: int, prefix: str):
+    groups = await db.db_get_groups_by_owner(uid)
+    if not groups:
+        await bot.send_message(uid, "📁 У вас нет групп.")
+        return
+    _grp_index_cache[uid] = groups
+    rows = []
+    for i, g in enumerate(groups[:30]):
+        rows.append([(f"📁 {g}", f"{prefix}:gi:{i}")])
+    rows.append([("‹ Отмена", "action_cancel")])
+    await bot.send_message(chat_id, "📁 Выберите группу:",
+                           reply_markup=kb(*rows))
+
+
+async def _resolve_targets_all(uid: int) -> List[Dict[str, Any]]:
+    return await db.db_get_accounts_by_owner(uid)
+
+
+async def _resolve_targets_group(uid: int, gi: int) -> List[Dict[str, Any]]:
+    groups = _grp_index_cache.get(uid, [])
+    if 0 <= gi < len(groups):
+        return await db.db_get_accounts_by_group(uid, groups[gi])
+    return []
+
+
+async def _resolve_targets_manual(uid: int, chat_id: int
+                                  ) -> List[Dict[str, Any]]:
+    raw = await ask_with_cancel(
+        bot, chat_id, uid,
+        "📱 Пришлите номера (через запятую или с новой строки):"
+    )
+    if not raw:
+        return []
+    phones = []
+    for tok in re.split(r"[,\n;\s]+", raw):
+        p = validate_phone(tok)
+        if p:
+            phones.append(p)
+    out = []
+    for p in phones:
+        a = await db.db_get_account(p)
+        if a and a.get("owner_id") == uid:
+            out.append(a)
+    return out
+
+
+# =================================================================
+# ── СЕКЦИЯ: 🚀 МАССОВЫЙ ЗАЛИВ ──
+# =================================================================
+@dp.callback_query(F.data == "auto_mass")
+async def cb_auto_mass(cb: CallbackQuery):
+    uid = cb.from_user.id
+    if store.is_busy(uid):
+        return await cb.answer("⏳ Завершите текущее действие.",
+                               show_alert=True)
+    store.mass_data[uid] = {}
+    await cb.answer()
+    await _send_target_picker(cb.message.chat.id, "mass_t",
+                              "🚀 <b>Массовый залив</b>\nВыберите цели:")
+
+
+@dp.callback_query(F.data.startswith("mass_t:"))
+async def cb_mass_t(cb: CallbackQuery):
+    uid = cb.from_user.id
+    parts = cb.data.split(":")
+    mode = parts[1]
+    targets: List[Dict[str, Any]] = []
+    if mode == "all":
+        targets = await _resolve_targets_all(uid)
+        await cb.answer()
+    elif mode == "grp" and len(parts) == 2:
+        await cb.answer()
+        await _send_groups_picker(uid, cb.message.chat.id, "mass_t")
+        return
+    elif mode == "gi" and len(parts) == 3:
+        await cb.answer()
+        gi = int(parts[2])
+        targets = await _resolve_targets_group(uid, gi)
+    elif mode == "man":
+        await cb.answer()
+        targets = await _resolve_targets_manual(uid, cb.message.chat.id)
+    else:
+        return await cb.answer("Bad", show_alert=True)
+
+    if not targets:
+        await bot.send_message(uid, "❌ Цели не выбраны.")
+        return
+    store.mass_data[uid]["targets"] = [a["phone"] for a in targets]
+    await bot.send_message(
+        uid, f"✅ Целей: <b>{len(targets)}</b>. Дальше — данные."
+    )
+    await _mass_ask_names(uid, cb.message.chat.id)
+
+
+async def _mass_ask_names(uid: int, chat_id: int):
+    txt = await ask_with_cancel(
+        bot, chat_id, uid,
+        "✏️ Пришлите ИМЕНА (каждое с новой строки).\n"
+        "Будет выбираться рандомно для каждого аккаунта."
+    )
+    if not txt:
+        return await restore_main_menu(bot, chat_id, uid, "Отменено.")
+    names = [s.strip() for s in txt.splitlines() if s.strip()]
+    if not names:
+        names = []
+    store.mass_data[uid]["names"] = names
+
+    txt2 = await ask_with_cancel(
+        bot, chat_id, uid,
+        "📝 Пришлите БИО (каждое с новой строки)."
+    )
+    if txt2 is None:
+        return await restore_main_menu(bot, chat_id, uid, "Отменено.")
+    bios = [s.strip() for s in txt2.splitlines() if s.strip()]
+    store.mass_data[uid]["bios"] = bios
+
+    # Сбор фото
+    store.photo_collecting[uid] = True
+    store.clear_temp_photos(uid)
+    await bot.send_message(
+        chat_id,
+        "📸 Пришлите ФОТО (несколько). Затем нажмите «📸 Готово».",
+        reply_markup=kb(
+            [("📸 Готово", "mass_photodone")],
+            [("❌ Отмена", "action_cancel")],
+        ),
+    )
+
+
+@dp.callback_query(F.data == "mass_photodone")
+async def cb_mass_photodone(cb: CallbackQuery):
+    uid = cb.from_user.id
+    photos = store.get_temp_photos(uid)
+    store.photo_collecting[uid] = False
+    md = store.mass_data.get(uid) or {}
+    md["photos"] = photos
+    await cb.answer()
+    targets = md.get("targets") or []
+    if not targets:
+        return await cb.message.answer("❌ Цели потеряны.")
+    if not (md.get("names") or md.get("bios") or md.get("photos")):
+        return await cb.message.answer("❌ Нечего применять.")
+
+    async def _runner():
+        await _start_progress(bot, cb.message.chat.id, uid,
+                              total=len(targets), store=store,
+                              title="🚀 Массовый залив")
+        ok = 0
+        for ph in targets:
+            await _update_progress(bot, uid, store, current=ph)
+            try:
+                cli = await get_or_create_account_client(ph, uid)
+                if not cli:
+                    await _update_progress(bot, uid, store, done_inc=1,
+                                           current=None,
+                                           error=f"{ph}: не подключился")
+                    continue
+                first_name = (random.choice(md["names"])
+                              if md.get("names") else None)
+                about = (random.choice(md["bios"])
+                         if md.get("bios") else None)
+                kwargs = {}
+                if first_name is not None:
+                    kwargs["first_name"] = first_name[:64]
+                if about is not None:
+                    kwargs["about"] = about[:70]
+                if kwargs:
+                    await cli(UpdateProfileRequest(**kwargs))
+                if md.get("photos"):
+                    photo_path = random.choice(md["photos"])
+                    try:
+                        existing = await cli(GetUserPhotosRequest(
+                            user_id="me", offset=0, max_id=0, limit=10))
+                        ips = [InputPhoto(id=p.id,
+                                          access_hash=p.access_hash,
+                                          file_reference=p.file_reference)
+                               for p in existing.photos]
+                        if ips:
+                            await cli(DeletePhotosRequest(id=ips))
+                    except Exception:
+                        pass
+                    await cli(UploadProfilePhotoRequest(
+                        file=await cli.upload_file(photo_path)
+                    ))
+                ok += 1
+                await _update_progress(bot, uid, store, done_inc=1,
+                                       current=None)
+            except Exception as e:
+                await _update_progress(bot, uid, store, done_inc=1,
+                                       current=None,
+                                       error=f"{ph}: {e}")
+            await asyncio.sleep(random.uniform(7, 20))
+        await _finish_progress(bot, uid, store,
+                               summary_extra=f"Обновлено: {ok}/{len(targets)}")
+        store.clear_temp_photos(uid)
+        store.mass_data.pop(uid, None)
+        await restore_main_menu(bot, cb.message.chat.id, uid)
+
+    await task_queue.submit(
+        _runner, owner_id=uid, notify=notify_owner,
+        title=f"Массовый залив {len(targets)}",
+    )
+
+
+# =================================================================
+# ── СЕКЦИЯ: 🤖 РЕГА ЛДВ ──
+# =================================================================
+@dp.callback_query(F.data == "auto_ldv")
+async def cb_auto_ldv(cb: CallbackQuery):
+    uid = cb.from_user.id
+    if store.is_busy(uid):
+        return await cb.answer("⏳ Занято.", show_alert=True)
+    store.ldv_data[uid] = {}
+    await cb.answer()
+    await _send_target_picker(cb.message.chat.id, "ldvr_t",
+                              "🤖 <b>Рега ЛДВ</b>\nВыберите цели:")
+
+
+@dp.callback_query(F.data.startswith("ldvr_t:"))
+async def cb_ldvr_t(cb: CallbackQuery):
+    uid = cb.from_user.id
+    parts = cb.data.split(":")
+    mode = parts[1]
+    targets = []
+    if mode == "all":
+        targets = await _resolve_targets_all(uid); await cb.answer()
+    elif mode == "grp" and len(parts) == 2:
+        await cb.answer()
+        return await _send_groups_picker(uid, cb.message.chat.id, "ldvr_t")
+    elif mode == "gi":
+        await cb.answer()
+        targets = await _resolve_targets_group(uid, int(parts[2]))
+    elif mode == "man":
+        await cb.answer()
+        targets = await _resolve_targets_manual(uid, cb.message.chat.id)
+    else:
+        return await cb.answer("Bad", show_alert=True)
+    if not targets:
+        return await bot.send_message(uid, "❌ Целей нет.")
+    store.ldv_data[uid]["targets"] = [a["phone"] for a in targets]
+
+    raw = await ask_with_cancel(
+        bot, cb.message.chat.id, uid,
+        "📋 Пришлите данные (6 строк через Enter):\n"
+        "1. Возраст (можно несколько через запятую)\n"
+        "2. Пол: «Я девушка» или «Я парень»\n"
+        "3. Кого показывать: «Парни» или «Девушки»\n"
+        "4. Город (можно несколько через запятую)\n"
+        "5. Имя (можно несколько через запятую)\n"
+        "6. Задержка в минутах перед стартом",
+    )
+    if not raw:
+        return await restore_main_menu(bot, cb.message.chat.id, uid)
+    lines = [s.strip() for s in raw.splitlines() if s.strip()]
+    if len(lines) < 6:
+        return await bot.send_message(
+            uid, "❌ Нужно 6 непустых строк."
+        )
+    ages   = [s.strip() for s in lines[0].split(",") if s.strip()]
+    sex    = lines[1]
+    target = lines[2]
+    cities = [s.strip() for s in lines[3].split(",") if s.strip()]
+    names  = [s.strip() for s in lines[4].split(",") if s.strip()]
+    try:
+        delay_min = float(lines[5])
+    except Exception:
+        delay_min = 0.0
+    store.ldv_data[uid].update({
+        "ages": ages, "sex": sex, "target": target,
+        "cities": cities, "names": names, "delay_min": delay_min,
+    })
+
+    store.photo_collecting[uid] = True
+    store.clear_temp_photos(uid)
+    await bot.send_message(
+        cb.message.chat.id,
+        "📸 Пришлите ФОТО (несколько). Затем нажмите «📸 Готово».",
+        reply_markup=kb(
+            [("📸 Готово", "ldvr_photodone")],
+            [("🛑 Отменить регистрацию ЛДВ", "ldvr_cancel_all")],
+            [("❌ Отмена", "action_cancel")],
+        ),
+    )
+
+
+@dp.callback_query(F.data == "ldvr_cancel_all")
+async def cb_ldvr_cancel_all(cb: CallbackQuery):
+    uid = cb.from_user.id
+    d = store.ldv_data.get(uid) or {}
+    n = 0
+    for ph in d.get("targets") or []:
+        store.ldv_reg_cancel.add(ph)
+        n += 1
+    await cb.answer(f"Отменяю партию ЛДВ ({n}).", show_alert=True)
+
+
+@dp.callback_query(F.data == "ldvr_photodone")
+async def cb_ldvr_photodone(cb: CallbackQuery):
+    uid = cb.from_user.id
+    photos = store.get_temp_photos(uid)
+    store.photo_collecting[uid] = False
+    d = store.ldv_data.get(uid) or {}
+    d["photos"] = photos
+    targets = d.get("targets") or []
+    await cb.answer()
+    if not targets or not photos:
+        return await cb.message.answer("❌ Целей или фото нет.")
+
+    async def _runner():
+        if d.get("delay_min", 0) > 0:
+            await bot.send_message(
+                uid, f"⏱ Старт через {d['delay_min']:.1f} мин."
+            )
+            await asyncio.sleep(d["delay_min"] * 60)
+        await _start_progress(bot, cb.message.chat.id, uid,
+                              total=len(targets), store=store,
+                              title="🤖 Рега ЛДВ")
+        success = []
+        for ph in targets:
+            if ph in store.ldv_reg_cancel:
+                store.ldv_reg_cancel.discard(ph)
+                await _update_progress(bot, uid, store, done_inc=1,
+                                       error=f"{ph}: отменено")
+                continue
+            await _update_progress(bot, uid, store, current=ph)
+            try:
+                cli = await get_or_create_account_client(ph, uid)
+                if not cli:
+                    raise RuntimeError("connect failed")
+                # пытаемся возобновить, если в reg_state есть состояние
+                state = await db.db_get_reg_state(ph, config.LDV_BOT)
+                if state:
+                    ok = await register_ldv_resumable(
+                        cli, ph, dict(d), uid,
+                        notify_func=lambda t, _u=uid:
+                            user_log(_u, t),
+                        photos_request_func=None,
+                        cancel_set=store.ldv_reg_cancel,
+                    )
+                else:
+                    ok = await register_one_ldv(
+                        cli, ph, dict(d),
+                        notify_func=lambda t, _u=uid:
+                            user_log(_u, t),
+                        owner_id=uid,
+                        cancel_set=store.ldv_reg_cancel,
+                    )
+                if ok:
+                    success.append(ph)
+                await _update_progress(bot, uid, store, done_inc=1,
+                                       current=None,
+                                       error=None if ok
+                                       else f"{ph}: не зарегистрирован")
+            except Exception as e:
+                await _update_progress(bot, uid, store, done_inc=1,
+                                       error=f"{ph}: {e}")
+        # запланировать лайкинг через 10 часов
+        nxt = time.time() + config.LDV_INITIAL_DELAY_HOURS * 3600
+        for ph in success:
+            await db.db_schedule_ldv_task(ph, uid, nxt, step=0,
+                                          status="pending")
+        await _finish_progress(
+            bot, uid, store,
+            summary_extra=(f"Зарегистрировано: {len(success)}/{len(targets)}\n"
+                           f"📅 Лайкинг запланирован через "
+                           f"{config.LDV_INITIAL_DELAY_HOURS}ч "
+                           f"для {len(success)} аккаунтов."),
+        )
+        store.clear_temp_photos(uid)
+        store.ldv_data.pop(uid, None)
+        await restore_main_menu(bot, cb.message.chat.id, uid)
+
+    await task_queue.submit(
+        _runner, owner_id=uid, notify=notify_owner,
+        title=f"Рега ЛДВ {len(targets)}",
+    )
+
+
+# =================================================================
+# ── СЕКЦИЯ: 💘 РЕГА XO ──
+# =================================================================
+@dp.callback_query(F.data == "auto_xo")
+async def cb_auto_xo(cb: CallbackQuery):
+    uid = cb.from_user.id
+    if store.is_busy(uid):
+        return await cb.answer("⏳ Занято.", show_alert=True)
+    store.xo_data[uid] = {}
+    await cb.answer()
+    await _send_target_picker(cb.message.chat.id, "xor_t",
+                              "💘 <b>Рега XO</b>\nВыберите цели:")
+
+
+@dp.callback_query(F.data.startswith("xor_t:"))
+async def cb_xor_t(cb: CallbackQuery):
+    uid = cb.from_user.id
+    parts = cb.data.split(":")
+    mode = parts[1]
+    targets = []
+    if mode == "all":
+        targets = await _resolve_targets_all(uid); await cb.answer()
+    elif mode == "grp" and len(parts) == 2:
+        await cb.answer()
+        return await _send_groups_picker(uid, cb.message.chat.id, "xor_t")
+    elif mode == "gi":
+        await cb.answer()
+        targets = await _resolve_targets_group(uid, int(parts[2]))
+    elif mode == "man":
+        await cb.answer()
+        targets = await _resolve_targets_manual(uid, cb.message.chat.id)
+    else:
+        return await cb.answer("Bad", show_alert=True)
+    if not targets:
+        return await bot.send_message(uid, "❌ Целей нет.")
+    store.xo_data[uid]["targets"] = [a["phone"] for a in targets]
+
+    raw = await ask_with_cancel(
+        bot, cb.message.chat.id, uid,
+        "📋 Пришлите данные (4 строки через Enter):\n"
+        "1. Пол: «💁‍♀️ я девушка» или «🙋‍♂️ я парень»\n"
+        "2. Дата рождения (дд.мм.гггг)\n"
+        "3. Город\n"
+        "4. Имя",
+    )
+    if not raw:
+        return await restore_main_menu(bot, cb.message.chat.id, uid)
+    lines = [s.strip() for s in raw.splitlines() if s.strip()]
+    if len(lines) < 4:
+        return await bot.send_message(uid, "❌ Нужно 4 непустых строк.")
+    store.xo_data[uid].update({
+        "sex": lines[0], "birthday": lines[1],
+        "city": lines[2], "name": lines[3],
+    })
+    store.photo_collecting[uid] = True
+    store.clear_temp_photos(uid)
+    await bot.send_message(
+        cb.message.chat.id,
+        "📸 Пришлите ФОТО для XO. Затем «📸 Готово».",
+        reply_markup=kb(
+            [("📸 Готово", "xor_photodone")],
+            [("🛑 Отменить регистрацию XO", "xor_cancel_all")],
+            [("❌ Отмена", "action_cancel")],
+        ),
+    )
+
+
+@dp.callback_query(F.data == "xor_cancel_all")
+async def cb_xor_cancel_all(cb: CallbackQuery):
+    uid = cb.from_user.id
+    d = store.xo_data.get(uid) or {}
+    for ph in d.get("targets") or []:
+        store.xo_reg_cancel.add(ph)
+    await cb.answer("Отменяю партию XO.", show_alert=True)
+
+
+@dp.callback_query(F.data == "xor_photodone")
+async def cb_xor_photodone(cb: CallbackQuery):
+    uid = cb.from_user.id
+    photos = store.get_temp_photos(uid)
+    store.photo_collecting[uid] = False
+    d = store.xo_data.get(uid) or {}
+    d["photos"] = photos
+    targets = d.get("targets") or []
+    await cb.answer()
+    if not targets or not photos:
+        return await cb.message.answer("❌ Целей или фото нет.")
+
+    async def _runner():
+        await _start_progress(bot, cb.message.chat.id, uid,
+                              total=len(targets), store=store,
+                              title="💘 Рега XO")
+        success = []
+        for ph in targets:
+            if ph in store.xo_reg_cancel:
+                await _update_progress(bot, uid, store, done_inc=1,
+                                       error=f"{ph}: отменено")
+                continue
+            await _update_progress(bot, uid, store, current=ph)
+            try:
+                cli = await get_or_create_account_client(ph, uid)
+                if not cli:
+                    raise RuntimeError("connect failed")
+                state = await db.db_get_reg_state(ph, config.XO_BOT)
+                if state:
+                    ok = await register_xo_resumable(
+                        cli, ph, dict(d), uid,
+                        notify_func=lambda t, _u=uid: user_log(_u, t),
+                        cancel_set=store.xo_reg_cancel,
+                    )
+                else:
+                    ok = await register_one_xo(
+                        cli, ph, dict(d),
+                        notify_func=lambda t, _u=uid: user_log(_u, t),
+                        cancel_set=store.xo_reg_cancel,
+                        owner_id=uid,
+                    )
+                if ok:
+                    success.append(ph)
+                await _update_progress(
+                    bot, uid, store, done_inc=1, current=None,
+                    error=None if ok else f"{ph}: не зарегистрирован",
+                )
+            except Exception as e:
+                await _update_progress(bot, uid, store, done_inc=1,
+                                       error=f"{ph}: {e}")
+
+        # запустить лайкинг для успешных
+        for ph in success:
+            await db.db_schedule_xo_task(ph, uid, time.time() + 5,
+                                         status="pending")
+        await _finish_progress(
+            bot, uid, store,
+            summary_extra=(f"Зарегистрировано: {len(success)}/{len(targets)}\n"
+                           f"💘 XO-лайкинг запланирован."),
+        )
+        store.clear_temp_photos(uid)
+        store.xo_data.pop(uid, None)
+        for ph in targets:
+            store.xo_reg_cancel.discard(ph)
+        await restore_main_menu(bot, cb.message.chat.id, uid)
+
+    await task_queue.submit(
+        _runner, owner_id=uid, notify=notify_owner,
+        title=f"Рега XO {len(targets)}",
+    )
+
+
+# =================================================================
+# ── СЕКЦИЯ: 📺 ПОДПИСКА НА ДВ ──
+# =================================================================
+@dp.callback_query(F.data == "auto_subdv")
+async def cb_auto_subdv(cb: CallbackQuery):
+    uid = cb.from_user.id
+    if store.is_busy(uid):
+        return await cb.answer("⏳ Занято.", show_alert=True)
+    await cb.answer()
+    await _send_target_picker(cb.message.chat.id, "subdv_t",
+                              "📺 <b>Подписка на @leoday</b>\n"
+                              "Выберите цели:")
+
+
+@dp.callback_query(F.data.startswith("subdv_t:"))
+async def cb_subdv_t(cb: CallbackQuery):
+    uid = cb.from_user.id
+    parts = cb.data.split(":")
+    mode = parts[1]
+    targets = []
+    if mode == "all":
+        targets = await _resolve_targets_all(uid); await cb.answer()
+    elif mode == "grp" and len(parts) == 2:
+        await cb.answer()
+        return await _send_groups_picker(uid, cb.message.chat.id, "subdv_t")
+    elif mode == "gi":
+        await cb.answer()
+        targets = await _resolve_targets_group(uid, int(parts[2]))
+    elif mode == "man":
+        await cb.answer()
+        targets = await _resolve_targets_manual(uid, cb.message.chat.id)
+    else:
+        return await cb.answer("Bad", show_alert=True)
+    if not targets:
+        return await bot.send_message(uid, "❌ Целей нет.")
+
+    async def _runner():
+        await _start_progress(bot, cb.message.chat.id, uid,
+                              total=len(targets), store=store,
+                              title="📺 Подписка @leoday")
+        ok = 0
+        for a in targets:
+            ph = a["phone"]
+            await _update_progress(bot, uid, store, current=ph)
+            try:
+                cli = await get_or_create_account_client(ph, uid)
+                if not cli:
+                    raise RuntimeError("connect failed")
+                from telethon.tl.functions.channels import JoinChannelRequest
+                await asyncio.wait_for(cli(JoinChannelRequest("leoday")),
+                                       timeout=5)
+                ok += 1
+                await _update_progress(bot, uid, store, done_inc=1,
+                                       current=None)
+            except Exception as e:
+                await _update_progress(bot, uid, store, done_inc=1,
+                                       error=f"{ph}: {e}")
+            await asyncio.sleep(random.uniform(5, 15))
+        await _finish_progress(
+            bot, uid, store,
+            summary_extra=f"Подписано: {ok}/{len(targets)}",
+        )
+        await restore_main_menu(bot, cb.message.chat.id, uid)
+
+    await task_queue.submit(
+        _runner, owner_id=uid, notify=notify_owner,
+        title=f"Подписка @leoday {len(targets)}",
+    )
+
+
+# =================================================================
+# ── СЕКЦИЯ: 💬 АВТООТВЕТЫ — UI ──
+# =================================================================
+@dp.callback_query(F.data == "auto_ar")
+async def cb_auto_ar(cb: CallbackQuery):
+    uid = cb.from_user.id
+    accs = await db.db_get_accounts_by_owner(uid)
+    rows = []
+    for a in accs[:30]:
+        ph = a["phone"]
+        on = await db.db_ar_is_enabled(uid, ph)
+        running = ar_manager.is_running(ph)
+        mark = "✅" if (on and running) else ("🟡" if on else "❌")
+        rows.append([(f"{mark} {ph}", f"ar_view:{ph}")])
+    rows.append([("✅ Включить все", "ar_enable_all"),
+                 ("❌ Выключить все", "ar_disable_all")])
+    rows.append([("📁 По группе", "ar_by_group"),
+                 ("✏️ Изменить текст всем", "ar_text_all")])
+    rows.append([home_btn()])
+    await cb.message.edit_text(
+        "💬 <b>Автоответы</b>\n"
+        "✅ — включён и работает | 🟡 — включён, но клиент не запущен | "
+        "❌ — выключен",
+        reply_markup=kb(*rows),
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("ar_view:"))
+async def cb_ar_view(cb: CallbackQuery):
+    phone = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    s = await db.db_ar_get_settings(uid, phone)
+    on = bool(s.get("enabled"))
+    custom = s.get("custom_text") or "—"
+    silenced = ar_manager.silenced_count(phone)
+    text = (
+        f"💬 <code>{phone}</code>\n"
+        f"Статус: {'✅ Вкл' if on else '❌ Выкл'}\n"
+        f"Свой текст: <i>{(custom[:120] if custom else '—')}</i>\n"
+        f"Замолчанных чатов: <b>{silenced}</b>"
+    )
+    rows = [
+        [(("❌ Выключить" if on else "✅ Включить"),
+          f"ar_toggle:{phone}")],
+        [("✏️ Свой текст", f"ar_text:{phone}")],
+        [("🔇 Сброс замолчанных", f"ar_reset:{phone}")],
+        [("‹ Назад", "auto_ar")],
+    ]
+    try:
+        await cb.message.edit_text(text, reply_markup=kb(*rows))
+    except TelegramBadRequest:
+        await cb.message.answer(text, reply_markup=kb(*rows))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("ar_toggle:"))
+async def cb_ar_toggle(cb: CallbackQuery):
+    phone = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    on = await db.db_ar_is_enabled(uid, phone)
+    new = not on
+    await db.db_ar_set_enabled(uid, phone, new)
+    if new:
+        # запустить
+        proxy = await get_proxy_for_account(phone, uid)
+        s = await db.db_ar_get_settings(uid, phone)
+        ok = await ar_manager.start(phone, uid, proxy,
+                                    custom_text=s.get("custom_text"))
+        await cb.answer("Включён." if ok else "Не запустился.",
+                        show_alert=not ok)
+    else:
+        await ar_manager.stop(phone)
+        await cb.answer("Выключен.")
+    # перерисовать
+    await cb_ar_view(cb)
+
+
+@dp.callback_query(F.data.startswith("ar_text:"))
+async def cb_ar_text(cb: CallbackQuery):
+    phone = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    await cb.answer()
+    txt = await ask_with_cancel(
+        bot, cb.message.chat.id, uid,
+        f"✏️ Свой текст для <code>{phone}</code> "
+        f"(или «-» чтобы сбросить):"
+    )
+    if txt is None:
+        return
+    txt = txt.strip()
+    if txt == "-":
+        new = None
+    else:
+        new = txt[:200]
+    await db.db_ar_set_custom_text(uid, phone, new)
+    ar_manager.set_custom_text(phone, new)
+    await cb.message.answer("✅ Текст обновлён.")
+
+
+@dp.callback_query(F.data.startswith("ar_reset:"))
+async def cb_ar_reset(cb: CallbackQuery):
+    phone = cb.data.split(":", 1)[1]
+    n = ar_manager.reset_silenced(phone)
+    await cb.answer(f"Сброшено: {n}")
+
+
+async def _ar_set_all(uid: int, value: bool, group: Optional[str] = None):
+    if group:
+        accs = await db.db_get_accounts_by_group(uid, group)
+    else:
+        accs = await db.db_get_accounts_by_owner(uid)
+    n = 0
+    for a in accs:
+        ph = a["phone"]
+        await db.db_ar_set_enabled(uid, ph, value)
+        if value:
+            proxy = await get_proxy_for_account(ph, uid)
+            s = await db.db_ar_get_settings(uid, ph)
+            await ar_manager.start(ph, uid, proxy,
+                                   custom_text=s.get("custom_text"))
+        else:
+            await ar_manager.stop(ph)
+        n += 1
+    return n
+
+
+@dp.callback_query(F.data == "ar_enable_all")
+async def cb_ar_enable_all(cb: CallbackQuery):
+    n = await _ar_set_all(cb.from_user.id, True)
+    await cb.answer(f"Включено: {n}", show_alert=True)
+
+
+@dp.callback_query(F.data == "ar_disable_all")
+async def cb_ar_disable_all(cb: CallbackQuery):
+    n = await _ar_set_all(cb.from_user.id, False)
+    await cb.answer(f"Выключено: {n}", show_alert=True)
+
+
+@dp.callback_query(F.data == "ar_by_group")
+async def cb_ar_by_group(cb: CallbackQuery):
+    uid = cb.from_user.id
+    groups = await db.db_get_groups_by_owner(uid)
+    if not groups:
+        return await cb.answer("Групп нет.", show_alert=True)
+    _grp_index_cache[uid] = groups
+    rows = []
+    for i, g in enumerate(groups[:20]):
+        rows.append([(f"📁 {g} (вкл)", f"ar_grp:on:{i}"),
+                     (f"📁 {g} (выкл)", f"ar_grp:off:{i}")])
+    rows.append([("‹ Назад", "auto_ar")])
+    await cb.message.edit_text("📁 Автоответ по группе:",
+                               reply_markup=kb(*rows))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("ar_grp:"))
+async def cb_ar_grp(cb: CallbackQuery):
+    parts = cb.data.split(":")
+    mode = parts[1]
+    gi = int(parts[2])
+    uid = cb.from_user.id
+    groups = _grp_index_cache.get(uid, [])
+    if not (0 <= gi < len(groups)):
+        return await cb.answer("Bad", show_alert=True)
+    n = await _ar_set_all(uid, mode == "on", group=groups[gi])
+    await cb.answer(f"Готово: {n} аккаунтов.", show_alert=True)
+
+
+@dp.callback_query(F.data == "ar_text_all")
+async def cb_ar_text_all(cb: CallbackQuery):
+    uid = cb.from_user.id
+    await cb.answer()
+    txt = await ask_with_cancel(
+        bot, cb.message.chat.id, uid,
+        "✏️ Свой текст для ВСЕХ аккаунтов (или «-» чтобы сбросить):"
+    )
+    if txt is None:
+        return
+    new = None if txt.strip() == "-" else txt.strip()[:200]
+    accs = await db.db_get_accounts_by_owner(uid)
+    n = 0
+    for a in accs:
+        await db.db_ar_set_custom_text(uid, a["phone"], new)
+        ar_manager.set_custom_text(a["phone"], new)
+        n += 1
+    await cb.message.answer(f"✅ Применено к {n} аккаунтам.")
+
+
+# =================================================================
+# ── СЕКЦИЯ: 📊 УПРАВЛЕНИЕ — ПОДРАЗДЕЛЫ ──
+# =================================================================
+
+# ── 💘 Рега XO (alias на auto_xo)
+@dp.callback_query(F.data == "mng_xo")
+async def cb_mng_xo(cb: CallbackQuery):
+    # просто вызываем auto_xo
+    cb.data = "auto_xo"
+    await cb_auto_xo(cb)
+
+
+# ── ❤️ Ручной пролайк ДВ ──
+@dp.callback_query(F.data == "mng_manual_ldv")
+async def cb_mng_manual_ldv(cb: CallbackQuery):
+    uid = cb.from_user.id
+    await cb.answer()
+    raw = await ask_with_cancel(
+        bot, cb.message.chat.id, uid,
+        "❤️ Пришлите номера для немедленного пролайка ДВ "
+        "(через запятую или с новой строки):",
+    )
+    if not raw:
+        return
+    phones = []
+    for tok in re.split(r"[,\n;\s]+", raw):
+        p = validate_phone(tok)
+        if p:
+            phones.append(p)
+    n = 0
+    for ph in phones:
+        a = await db.db_get_account(ph)
+        if a and a.get("owner_id") == uid:
+            await db.db_schedule_ldv_task(ph, uid, time.time() + 2,
+                                          step=0, status="pending")
+            store.cancelled_phones.discard(ph)
+            store.paused_phones.discard(ph)
+            n += 1
+    await cb.message.answer(f"✅ Запланировано: {n}.")
+
+
+# ── ⚙️ Управление лайкингом ДВ ──
+@dp.callback_query(F.data == "mng_ldv")
+async def cb_mng_ldv(cb: CallbackQuery):
+    await cb.message.edit_text(
+        "⚙️ <b>Управление лайкингом ДВ</b>",
+        reply_markup=kb(
+            [("📋 Активные циклы", "mng_ldv_list:0")],
+            [("🔄 Сбросить все", "mng_ldv_resetall")],
+            [("📁 Сбросить в группе", "mng_ldv_resetgrp")],
+            [("🎯 Сбросить выборочно", "mng_ldv_resetman")],
+            [("‹ Назад", "back_manage"), home_btn()],
+        ),
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "back_manage")
+async def cb_back_manage(cb: CallbackQuery):
+    # перерисуем меню «Управление»
+    await cb.message.edit_text(
+        "📊 <b>Управление</b>",
+        reply_markup=kb(
+            [("💘 Рега XO", "mng_xo")],
+            [("❤️ Ручной пролайк ДВ", "mng_manual_ldv")],
+            [("⚙️ Управление лайкингом", "mng_ldv")],
+            [("💘 Управление XO", "mng_xo_panel")],
+            [("🛑 Отмена регистрации", "mng_regcancel")],
+            [home_btn()],
+        ),
+    )
+    await cb.answer()
+
+
+# обёртка над панелью XO (чтобы можно было войти из меню «Управление»)
+@dp.callback_query(F.data == "mng_xo_panel")
+async def cb_mng_xo_panel(cb: CallbackQuery):
+    await _xo_manage_render(cb.message.chat.id, cb.from_user.id,
+                            edit_msg=cb.message)
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("mng_ldv_list:"))
+async def cb_mng_ldv_list(cb: CallbackQuery):
+    uid = cb.from_user.id
+    try:
+        page = int(cb.data.split(":", 1)[1])
+    except Exception:
+        page = 0
+    tasks = await db.db_get_ldv_tasks_by_owner(uid)
+    per = 8
+    total = len(tasks)
+    pages = max(1, (total + per - 1) // per)
+    page = max(0, min(page, pages - 1))
+    chunk = tasks[page * per:(page + 1) * per]
+
+    if not tasks:
+        await cb.message.edit_text(
+            "📋 LDV-циклов нет.",
+            reply_markup=kb([("‹ Назад", "mng_ldv")]),
+        )
+        return await cb.answer()
+
+    lines = ["📋 <b>Активные LDV-циклы</b>:"]
+    rows = []
+    for t in chunk:
+        ph = t["phone"]
+        st = t["status"]
+        nxt = time.strftime("%d.%m %H:%M",
+                            time.localtime(t["next_run"] or 0))
+        paused = "⏸" if ph in store.paused_phones else ""
+        running = "▶️" if ph in store.current_liking_phones else ""
+        lines.append(
+            f"{paused}{running} {ph} — {st} / next: {nxt} / step={t['step']}"
+        )
+        # три кнопки в ряд: пауза / возобновить / удалить
+        is_paused = ph in store.paused_phones
+        rows.append([
+            ((("▶️ Resume" if is_paused else "⏸ Pause"),
+              f"mng_ldv_pp:{ph}")),
+            (("🗑 Удалить", f"mng_ldv_del:{ph}")),
+        ])
+    nav = []
+    if page > 0:
+        nav.append(("◀️", f"mng_ldv_list:{page-1}"))
+    nav.append((f"{page+1}/{pages}", "noop"))
+    if page < pages - 1:
+        nav.append(("▶️", f"mng_ldv_list:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([("‹ Назад", "mng_ldv")])
+    await cb.message.edit_text("\n".join(lines), reply_markup=kb(*rows))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("mng_ldv_pp:"))
+async def cb_mng_ldv_pp(cb: CallbackQuery):
+    ph = cb.data.split(":", 1)[1]
+    if ph in store.paused_phones:
+        store.paused_phones.discard(ph)
+        await cb.answer("▶️ Возобновлён.")
+    else:
+        store.paused_phones.add(ph)
+        await cb.answer("⏸ На паузе.")
+    cb.data = "mng_ldv_list:0"
+    await cb_mng_ldv_list(cb)
+
+
+@dp.callback_query(F.data.startswith("mng_ldv_del:"))
+async def cb_mng_ldv_del(cb: CallbackQuery):
+    ph = cb.data.split(":", 1)[1]
+    store.cancelled_phones.add(ph)
+    await db.db_delete_ldv_task(ph)
+    await cb.answer("🗑 Задача удалена.")
+    cb.data = "mng_ldv_list:0"
+    await cb_mng_ldv_list(cb)
+
+
+@dp.callback_query(F.data == "mng_ldv_resetall")
+async def cb_mng_ldv_resetall(cb: CallbackQuery):
+    uid = cb.from_user.id
+    await cb.answer()
+    confirm = await ask_with_cancel(
+        bot, cb.message.chat.id, uid,
+        "⚠️ Удалить ВСЕ LDV-задачи? Напишите <b>ДА</b>.",
+    )
+    if not confirm or confirm.strip().lower() != "да":
+        return await cb.message.answer("Отменено.")
+    tasks = await db.db_get_ldv_tasks_by_owner(uid)
+    for t in tasks:
+        store.cancelled_phones.add(t["phone"])
+    n = await db.db_delete_ldv_tasks_by_owner(uid)
+    await cb.message.answer(f"🗑 Удалено: {n}")
+
+
+@dp.callback_query(F.data == "mng_ldv_resetgrp")
+async def cb_mng_ldv_resetgrp(cb: CallbackQuery):
+    uid = cb.from_user.id
+    groups = await db.db_get_groups_by_owner(uid)
+    if not groups:
+        return await cb.answer("Групп нет.", show_alert=True)
+    _grp_index_cache[uid] = groups
+    rows = [[(f"📁 {g}", f"mng_ldv_grpdel:{i}")]
+            for i, g in enumerate(groups[:30])]
+    rows.append([("‹ Назад", "mng_ldv")])
+    await cb.message.edit_text("📁 Выберите группу:",
+                               reply_markup=kb(*rows))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("mng_ldv_grpdel:"))
+async def cb_mng_ldv_grpdel(cb: CallbackQuery):
+    uid = cb.from_user.id
+    gi = int(cb.data.split(":", 1)[1])
+    groups = _grp_index_cache.get(uid, [])
+    if not (0 <= gi < len(groups)):
+        return await cb.answer("Bad", show_alert=True)
+    grp = groups[gi]
+    accs = await db.db_get_accounts_by_group(uid, grp)
+    for a in accs:
+        store.cancelled_phones.add(a["phone"])
+    n = await db.db_delete_ldv_tasks_by_group(uid, grp)
+    await cb.answer(f"🗑 Удалено: {n}", show_alert=True)
+
+
+@dp.callback_query(F.data == "mng_ldv_resetman")
+async def cb_mng_ldv_resetman(cb: CallbackQuery):
+    uid = cb.from_user.id
+    await cb.answer()
+    raw = await ask_with_cancel(
+        bot, cb.message.chat.id, uid,
+        "🎯 Пришлите номера для удаления LDV-задач:"
+    )
+    if not raw:
+        return
+    n = 0
+    for tok in re.split(r"[,\n;\s]+", raw):
+        p = validate_phone(tok)
+        if p:
+            store.cancelled_phones.add(p)
+            await db.db_delete_ldv_task(p)
+            n += 1
+    await cb.message.answer(f"🗑 Удалено: {n}")
+
+
+# =================================================================
+# ── СЕКЦИЯ: 💘 УПРАВЛЕНИЕ XO ──
+# =================================================================
+# В управление XO добавим переход через дополнительную кнопку — она
+# доступна как часть «Управление» через /xo_manage. Но удобнее показать
+# при отсутствии задач сразу из меню «Управление».
+@dp.message(Command("xo_manage"))
+async def cmd_xo_manage(msg: Message):
+    await _xo_manage_render(msg.chat.id, msg.from_user.id)
+
+
+async def _xo_manage_render(chat_id: int, uid: int, edit_msg=None):
+    tasks = await db.db_get_xo_tasks_by_owner(uid)
+    if not tasks:
+        text = "💘 XO-задач нет."
+        rows = [[("‹ Назад", "back_manage"), home_btn()]]
+    else:
+        text_lines = ["💘 <b>Активные XO-задачи</b>:"]
+        rows = []
+        for t in tasks[:30]:
+            ph = t["phone"]
+            st = t["status"]
+            nxt = time.strftime("%d.%m %H:%M",
+                                time.localtime(t["next_run"] or 0))
+            text_lines.append(f"• {ph} — {st} / next: {nxt}")
+            is_paused = ph in store.xo_liking_paused
+            rows.append([
+                ((("▶️ Resume" if is_paused else "⏸ Pause"),
+                  f"mng_xo_pp:{ph}")),
+                ("🛑 Стоп", f"mng_xo_stop:{ph}"),
+                ("🗑 Удалить", f"mng_xo_del:{ph}"),
+            ])
+        rows.append([("‹ Назад", "back_manage"), home_btn()])
+        text = "\n".join(text_lines)
+    if edit_msg:
+        try:
+            await edit_msg.edit_text(text, reply_markup=kb(*rows))
+            return
+        except TelegramBadRequest:
+            pass
+    await bot.send_message(chat_id, text, reply_markup=kb(*rows))
+
+
+@dp.callback_query(F.data.startswith("mng_xo_pp:"))
+async def cb_mng_xo_pp(cb: CallbackQuery):
+    ph = cb.data.split(":", 1)[1]
+    if ph in store.xo_liking_paused:
+        store.xo_liking_paused.discard(ph)
+        await db.db_update_xo_task(ph, status="running")
+        await cb.answer("▶️ Возобновлён.")
+    else:
+        store.xo_liking_paused.add(ph)
+        await db.db_update_xo_task(ph, status="paused")
+        await cb.answer("⏸ На паузе.")
+    await _xo_manage_render(cb.message.chat.id, cb.from_user.id,
+                            edit_msg=cb.message)
+
+
+@dp.callback_query(F.data.startswith("mng_xo_stop:"))
+async def cb_mng_xo_stop(cb: CallbackQuery):
+    ph = cb.data.split(":", 1)[1]
+    t = store.xo_liking_tasks.pop(ph, None)
+    if t and not t.done():
+        t.cancel()
+    await db.db_update_xo_task(ph, status="stopped")
+    await cb.answer("🛑 Остановлен.")
+    await _xo_manage_render(cb.message.chat.id, cb.from_user.id,
+                            edit_msg=cb.message)
+
+
+@dp.callback_query(F.data.startswith("mng_xo_del:"))
+async def cb_mng_xo_del(cb: CallbackQuery):
+    ph = cb.data.split(":", 1)[1]
+    t = store.xo_liking_tasks.pop(ph, None)
+    if t and not t.done():
+        t.cancel()
+    await db.db_delete_xo_task(ph)
+    await cb.answer("🗑 Удалена.")
+    await _xo_manage_render(cb.message.chat.id, cb.from_user.id,
+                            edit_msg=cb.message)
+
+
+# =================================================================
+# ── СЕКЦИЯ: 🛑 ОТМЕНА РЕГИСТРАЦИИ (LDV / XO) ──
+# =================================================================
+# Логика: пользователь добавляет номера в store.ldv_reg_cancel или
+# store.xo_reg_cancel. register_one_ldv / register_xo_resumable / etc.
+# проверяют этот set между шагами и прерываются.
+#
+# Главное меню отмены:
+@dp.callback_query(F.data == "mng_regcancel")
+async def cb_mng_regcancel(cb: CallbackQuery):
+    uid = cb.from_user.id
+    pending_ldv = len(store.ldv_reg_cancel)
+    pending_xo = len(store.xo_reg_cancel)
+    # покажем сколько сейчас в активных партиях
+    active_ldv_targets = (store.ldv_data.get(uid) or {}).get("targets") or []
+    active_xo_targets = (store.xo_data.get(uid) or {}).get("targets") or []
+    text = (
+        "🛑 <b>Отмена регистрации</b>\n\n"
+        f"Активная партия ЛДВ: <b>{len(active_ldv_targets)}</b> номеров\n"
+        f"Активная партия XO:  <b>{len(active_xo_targets)}</b> номеров\n\n"
+        f"Уже в очереди на отмену:\n"
+        f"  • ЛДВ: <b>{pending_ldv}</b>\n"
+        f"  • XO:  <b>{pending_xo}</b>"
+    )
+    await cb.message.edit_text(
+        text,
+        reply_markup=kb(
+            [("🤖 Отменить ЛДВ", "rc_ldv")],
+            [("💘 Отменить XO", "rc_xo")],
+            [("♻️ Очистить очередь отмены", "rc_clear")],
+            [("‹ Назад", "back_manage"), home_btn()],
+        ),
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "rc_clear")
+async def cb_rc_clear(cb: CallbackQuery):
+    n = len(store.ldv_reg_cancel) + len(store.xo_reg_cancel)
+    store.ldv_reg_cancel.clear()
+    store.xo_reg_cancel.clear()
+    await cb.answer(f"Очищено: {n}", show_alert=True)
+    cb.data = "mng_regcancel"
+    await cb_mng_regcancel(cb)
+
+
+# ── ЛДВ-отмена: меню вариантов ──
+@dp.callback_query(F.data == "rc_ldv")
+async def cb_rc_ldv(cb: CallbackQuery):
+    await cb.message.edit_text(
+        "🛑 <b>Отмена регистрации ЛДВ</b>\n"
+        "Выберите способ:",
+        reply_markup=kb(
+            [("Все", "rc_ldv_all")],
+            [("Группа", "rc_ldv_grp")],
+            [("По номерам", "rc_ldv_man")],
+            [("‹ Назад", "mng_regcancel"), home_btn()],
+        ),
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "rc_ldv_all")
+async def cb_rc_ldv_all(cb: CallbackQuery):
+    uid = cb.from_user.id
+    targets = (store.ldv_data.get(uid) or {}).get("targets") or []
+    accs = await db.db_get_accounts_by_owner(uid)
+    # отменяем ВСЕ — и активную партию, и про запас все аккаунты владельца
+    n = 0
+    for ph in targets:
+        store.ldv_reg_cancel.add(ph); n += 1
+    for a in accs:
+        store.ldv_reg_cancel.add(a["phone"])
+    await cb.answer(f"Отмена принята: {n} активных, "
+                    f"{len(accs)} аккаунтов в стоп-листе.",
+                    show_alert=True)
+
+
+@dp.callback_query(F.data == "rc_ldv_grp")
+async def cb_rc_ldv_grp(cb: CallbackQuery):
+    uid = cb.from_user.id
+    groups = await db.db_get_groups_by_owner(uid)
+    if not groups:
+        return await cb.answer("Групп нет.", show_alert=True)
+    _grp_index_cache[uid] = groups
+    rows = [[(f"📁 {g}", f"rc_ldv_gi:{i}")] for i, g in enumerate(groups[:30])]
+    rows.append([("‹ Назад", "rc_ldv")])
+    await cb.message.edit_text("📁 Выберите группу для отмены ЛДВ:",
+                               reply_markup=kb(*rows))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("rc_ldv_gi:"))
+async def cb_rc_ldv_gi(cb: CallbackQuery):
+    uid = cb.from_user.id
+    gi = int(cb.data.split(":", 1)[1])
+    groups = _grp_index_cache.get(uid, [])
+    if not (0 <= gi < len(groups)):
+        return await cb.answer("Bad", show_alert=True)
+    accs = await db.db_get_accounts_by_group(uid, groups[gi])
+    n = 0
+    for a in accs:
+        store.ldv_reg_cancel.add(a["phone"]); n += 1
+    await cb.answer(f"🛑 В группе «{groups[gi]}» отмечено: {n}",
+                    show_alert=True)
+
+
+@dp.callback_query(F.data == "rc_ldv_man")
+async def cb_rc_ldv_man(cb: CallbackQuery):
+    uid = cb.from_user.id
+    await cb.answer()
+    raw = await ask_with_cancel(
+        bot, cb.message.chat.id, uid,
+        "🛑 Пришлите номера для отмены ЛДВ-регистрации "
+        "(через запятую или с новой строки):",
+    )
+    if not raw:
+        return
+    n = 0
+    for tok in re.split(r"[,\n;\s]+", raw):
+        p = validate_phone(tok)
+        if p:
+            store.ldv_reg_cancel.add(p)
+            n += 1
+    await cb.message.answer(f"🛑 В стоп-лист ЛДВ добавлено: <b>{n}</b>")
+
+
+# ── XO-отмена: меню вариантов ──
+@dp.callback_query(F.data == "rc_xo")
+async def cb_rc_xo(cb: CallbackQuery):
+    await cb.message.edit_text(
+        "🛑 <b>Отмена регистрации XO</b>\n"
+        "Выберите способ:",
+        reply_markup=kb(
+            [("Все", "rc_xo_all")],
+            [("Группа", "rc_xo_grp")],
+            [("По номерам", "rc_xo_man")],
+            [("‹ Назад", "mng_regcancel"), home_btn()],
+        ),
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "rc_xo_all")
+async def cb_rc_xo_all(cb: CallbackQuery):
+    uid = cb.from_user.id
+    targets = (store.xo_data.get(uid) or {}).get("targets") or []
+    accs = await db.db_get_accounts_by_owner(uid)
+    n = 0
+    for ph in targets:
+        store.xo_reg_cancel.add(ph); n += 1
+    for a in accs:
+        store.xo_reg_cancel.add(a["phone"])
+    await cb.answer(f"Отмена принята: {n} активных, "
+                    f"{len(accs)} аккаунтов в стоп-листе.",
+                    show_alert=True)
+
+
+@dp.callback_query(F.data == "rc_xo_grp")
+async def cb_rc_xo_grp(cb: CallbackQuery):
+    uid = cb.from_user.id
+    groups = await db.db_get_groups_by_owner(uid)
+    if not groups:
+        return await cb.answer("Групп нет.", show_alert=True)
+    _grp_index_cache[uid] = groups
+    rows = [[(f"📁 {g}", f"rc_xo_gi:{i}")] for i, g in enumerate(groups[:30])]
+    rows.append([("‹ Назад", "rc_xo")])
+    await cb.message.edit_text("📁 Выберите группу для отмены XO:",
+                               reply_markup=kb(*rows))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("rc_xo_gi:"))
+async def cb_rc_xo_gi(cb: CallbackQuery):
+    uid = cb.from_user.id
+    gi = int(cb.data.split(":", 1)[1])
+    groups = _grp_index_cache.get(uid, [])
+    if not (0 <= gi < len(groups)):
+        return await cb.answer("Bad", show_alert=True)
+    accs = await db.db_get_accounts_by_group(uid, groups[gi])
+    n = 0
+    for a in accs:
+        store.xo_reg_cancel.add(a["phone"]); n += 1
+    await cb.answer(f"🛑 В группе «{groups[gi]}» отмечено: {n}",
+                    show_alert=True)
+
+
+@dp.callback_query(F.data == "rc_xo_man")
+async def cb_rc_xo_man(cb: CallbackQuery):
+    uid = cb.from_user.id
+    await cb.answer()
+    raw = await ask_with_cancel(
+        bot, cb.message.chat.id, uid,
+        "🛑 Пришлите номера для отмены XO-регистрации "
+        "(через запятую или с новой строки):",
+    )
+    if not raw:
+        return
+    n = 0
+    for tok in re.split(r"[,\n;\s]+", raw):
+        p = validate_phone(tok)
+        if p:
+            store.xo_reg_cancel.add(p)
+            n += 1
+    await cb.message.answer(f"🛑 В стоп-лист XO добавлено: <b>{n}</b>")
+
+
+# =================================================================
+# ── СЕКЦИЯ: 👑 АДМИН-ПАНЕЛЬ ──
+# =================================================================
+@dp.callback_query(F.data == "adm_wl")
+async def cb_adm_wl(cb: CallbackQuery):
+    if not await db.db_admins_check(cb.from_user.id):
+        return await cb.answer("⛔", show_alert=True)
+    rows_db = await db.db_whitelist_get_all()
+    text_lines = ["👥 <b>Whitelist</b>:"]
+    for r in rows_db[:30]:
+        text_lines.append(
+            f"• <code>{r['user_id']}</code>"
+            + (f" (@{r['username']})" if r.get('username') else "")
+        )
+    if not rows_db:
+        text_lines.append("— пусто —")
+    await cb.message.edit_text(
+        "\n".join(text_lines),
+        reply_markup=kb(
+            [("➕ Добавить", "adm_wl_add"),
+             ("🗑 Удалить", "adm_wl_del")],
+            [("‹ Назад", "adm_back"), home_btn()],
+        ),
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "adm_back")
+async def cb_adm_back(cb: CallbackQuery):
+    if not await db.db_admins_check(cb.from_user.id):
+        return await cb.answer("⛔", show_alert=True)
+    await cb.message.edit_text(
+        "👑 <b>Админ-панель</b>",
+        reply_markup=kb(
+            [("👥 Whitelist", "adm_wl")],
+            [("👮 Админы", "adm_admins")],
+            [("🌐 Глобальные прокси", "gpx_list")],
+            [("📋 Все аккаунты", "adm_all_accs")],
+            [home_btn()],
+        ),
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "adm_wl_add")
+async def cb_adm_wl_add(cb: CallbackQuery):
+    if not await db.db_admins_check(cb.from_user.id):
+        return await cb.answer("⛔", show_alert=True)
+    await cb.answer()
+    raw = await ask_with_cancel(
+        bot, cb.message.chat.id, cb.from_user.id,
+        "👤 Пришлите user_id или @username для добавления в whitelist:"
+    )
+    if not raw:
+        return
+    raw = raw.strip()
+    user_id = None
+    username = ""
+    if raw.startswith("@"):
+        username = raw[1:]
+        try:
+            chat = await bot.get_chat(raw)
+            user_id = chat.id
+            if chat.username:
+                username = chat.username
+        except Exception:
+            return await cb.message.answer("❌ Не нашёл такого пользователя.")
+    else:
+        try:
+            user_id = int(raw)
+        except Exception:
+            return await cb.message.answer("❌ user_id должен быть числом.")
+    await db.db_whitelist_add(user_id, username)
+    await cb.message.answer(
+        f"✅ Добавлен: <code>{user_id}</code>"
+        + (f" (@{username})" if username else "")
+    )
+
+
+@dp.callback_query(F.data == "adm_wl_del")
+async def cb_adm_wl_del(cb: CallbackQuery):
+    if not await db.db_admins_check(cb.from_user.id):
+        return await cb.answer("⛔", show_alert=True)
+    await cb.answer()
+    raw = await ask_with_cancel(
+        bot, cb.message.chat.id, cb.from_user.id,
+        "🗑 Пришлите user_id для удаления из whitelist:"
+    )
+    if not raw:
+        return
+    try:
+        user_id = int(raw.strip())
+    except Exception:
+        return await cb.message.answer("❌ user_id должен быть числом.")
+    await db.db_whitelist_remove(user_id)
+    await cb.message.answer(f"🗑 Удалён: <code>{user_id}</code>")
+
+
+@dp.callback_query(F.data == "adm_admins")
+async def cb_adm_admins(cb: CallbackQuery):
+    if not await db.db_admins_check(cb.from_user.id):
+        return await cb.answer("⛔", show_alert=True)
+    rows_db = await db.db_admins_get_all()
+    text_lines = ["👮 <b>Админы</b>:"]
+    for r in rows_db:
+        text_lines.append(f"• <code>{r['user_id']}</code>")
+    await cb.message.edit_text(
+        "\n".join(text_lines),
+        reply_markup=kb(
+            [("➕ Добавить", "adm_admins_add"),
+             ("🗑 Удалить", "adm_admins_del")],
+            [("‹ Назад", "adm_back"), home_btn()],
+        ),
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "adm_admins_add")
+async def cb_adm_admins_add(cb: CallbackQuery):
+    if not await db.db_admins_check(cb.from_user.id):
+        return await cb.answer("⛔", show_alert=True)
+    await cb.answer()
+    raw = await ask_with_cancel(
+        bot, cb.message.chat.id, cb.from_user.id,
+        "👮 user_id нового админа:"
+    )
+    if not raw:
+        return
+    try:
+        user_id = int(raw.strip())
+    except Exception:
+        return await cb.message.answer("❌ user_id должен быть числом.")
+    await db.db_admins_add(user_id)
+    await cb.message.answer(f"✅ Админ: <code>{user_id}</code>")
+
+
+@dp.callback_query(F.data == "adm_admins_del")
+async def cb_adm_admins_del(cb: CallbackQuery):
+    if not await db.db_admins_check(cb.from_user.id):
+        return await cb.answer("⛔", show_alert=True)
+    await cb.answer()
+    raw = await ask_with_cancel(
+        bot, cb.message.chat.id, cb.from_user.id,
+        "🗑 user_id админа для удаления:"
+    )
+    if not raw:
+        return
+    try:
+        user_id = int(raw.strip())
+    except Exception:
+        return await cb.message.answer("❌ user_id должен быть числом.")
+    await db.db_admins_remove(user_id)
+    await cb.message.answer(f"🗑 Админ удалён: <code>{user_id}</code>")
+
+
+@dp.callback_query(F.data == "adm_all_accs")
+async def cb_adm_all_accs(cb: CallbackQuery):
+    if not await db.db_admins_check(cb.from_user.id):
+        return await cb.answer("⛔", show_alert=True)
+    rows_db = await db.db_get_all_accounts()
+    if not rows_db:
+        text = "📋 Аккаунтов нет."
+    else:
+        lines = [f"📋 <b>Все аккаунты</b>: {len(rows_db)}"]
+        # сгруппируем по owner_id
+        by_owner: Dict[int, List[Dict[str, Any]]] = {}
+        for a in rows_db:
+            by_owner.setdefault(a.get("owner_id") or 0, []).append(a)
+        for owner_id, accs in by_owner.items():
+            lines.append(f"\n👤 <code>{owner_id}</code> — {len(accs)}:")
+            for a in accs[:20]:
+                lines.append(
+                    f"  • {a['phone']} (@{a.get('username') or '-'})"
+                    + (f" / {a.get('grp')}" if a.get('grp') else "")
+                )
+            if len(accs) > 20:
+                lines.append(f"  …и ещё {len(accs) - 20}")
+        text = "\n".join(lines)
+    # Telegram ограничение — режем
+    if len(text) > 3500:
+        text = text[:3500] + "\n…(обрезано)…"
+    await cb.message.edit_text(
+        text,
+        reply_markup=kb([("‹ Назад", "adm_back"), home_btn()]),
+    )
+    await cb.answer()
+
+
+# =================================================================
+# ── СЕКЦИЯ: BOOTSTRAP ──
+# =================================================================
+async def _bootstrap_autoreplies():
+    """Поднять менеджер автоответов для всех enabled пар (owner, phone)."""
+    rows = await db.db_ar_get_enabled_phones()
+    started = 0
+    for r in rows:
+        owner_id = r.get("owner_id")
+        phone = r.get("phone")
+        custom = r.get("custom_text")
+        if not phone or not owner_id:
+            continue
+        proxy = await get_proxy_for_account(phone, owner_id)
+        try:
+            ok = await ar_manager.start(phone, owner_id, proxy,
+                                        custom_text=custom)
+            if ok:
+                started += 1
+        except Exception as e:
+            log.warning("bootstrap autoreply %s: %s", phone, e)
+    log.info("Autoreplies started: %d", started)
+
+
+async def _bootstrap_dirs():
+    os.makedirs(config.SESSIONS_DIR, exist_ok=True)
+    os.makedirs(config.TEMP_DIR, exist_ok=True)
+
+
+async def _notify_admins(text: str) -> None:
+    """Разослать text всем админам (для health-check глобал-прокси)."""
+    try:
+        admins = await db.db_admins_get_all()
+    except Exception as e:
+        log.warning("notify_admins: get list: %s", e)
+        return
+    for a in admins:
+        uid = a.get("user_id")
+        if uid:
+            try:
+                await bot.send_message(uid, text)
+            except Exception as e:
+                log.debug("notify_admins(%s): %s", uid, e)
+
+
+async def _on_startup():
+    await _bootstrap_dirs()
+    await db.init_db()
+    # уведомлятель для AutoreplyManager
+    ar_manager.set_notifier(notify_owner)
+    # уведомлятель для health-check глобал-прокси (alive→dead)
+    set_admin_notifier(_notify_admins)
+    # фоновые таски
+    asyncio.create_task(run_health_check_loop())
+    asyncio.create_task(ldv_scheduler(store, task_queue=task_queue,
+                                      notify_func=notify_owner))
+    asyncio.create_task(xo_liking_scheduler(store, notify_func=notify_owner))
+    # автоответы из БД
+    asyncio.create_task(_bootstrap_autoreplies())
+    log.info("Менеджер запущен.")
+
+
+async def _on_shutdown():
+    log.info("Останавливаю менеджер…")
+    try:
+        await ar_manager.stop_all()
+    except Exception:
+        pass
+    # отменим XO-таски
+    for ph, t in list(store.xo_liking_tasks.items()):
+        store.xo_liking_tasks.pop(ph, None)
+        if not t.done():
+            t.cancel()
+    # отключим всех клиентов
+    for ph, cli in list(_account_clients.items()):
+        try:
+            await cli.disconnect()
+        except Exception:
+            pass
+        _account_clients.pop(ph, None)
+    try:
+        await bot.session.close()
+    except Exception:
+        pass
+
+
+# =================================================================
+# ── СЕКЦИЯ: MAIN ──
+# =================================================================
+async def main():
+    dp.startup.register(_on_startup)
+    dp.shutdown.register(_on_shutdown)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Остановлено пользователем.")
