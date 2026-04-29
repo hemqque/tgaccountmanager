@@ -26,11 +26,15 @@ from telethon.tl.types import InputMediaContact
 from telethon.tl.functions.messages import SendMediaRequest
 
 import db
+import client_pool as _client_pool
 from config import (
     API_ID, API_HASH, SESSIONS_DIR, LDV_BOT,
     LDV_LISTEN_LO, LDV_LISTEN_HI, LDV_RESPONSE_TIMEOUT,
 )
 from global_proxy import proxy_to_telethon, get_proxy_for_account
+
+# Телефоны, у которых уже зарегистрирован NewMessage-listener
+_ldv_listeners: set = set()
 
 log = logging.getLogger("ldv")
 
@@ -131,7 +135,6 @@ async def register_one_ldv(client: TelegramClient,
                 media=InputMediaContact(
                     phone_number=str(phone),
                     first_name=name, last_name="", vcard="",
-                    user_id=me.id,
                 ),
                 message="",
                 random_id=random.randint(1, 2**62),
@@ -163,8 +166,13 @@ async def register_one_ldv(client: TelegramClient,
 def ldv_attach_listener(client: TelegramClient, phone: str, store) -> None:
     """
     Регистрирует на client обработчик NewMessage от LDV_BOT.
-    Каждое полученное сообщение кладётся в store.last_ldv_msg[phone].
+    Идемпотентно — повторный вызов для того же phone ничего не делает
+    (нужно при использовании общего client_pool-клиента).
     """
+    if phone in _ldv_listeners:
+        return
+    _ldv_listeners.add(phone)
+
     @client.on(events.NewMessage(from_users=LDV_BOT))
     async def _on_msg(event):
         try:
@@ -201,15 +209,14 @@ async def ldv_liking_task(phone: str, owner_id: int, store,
     Если phone in store.paused_phones — спит и продолжает.
     """
     bot = LDV_BOT
-    session_path = os.path.join(SESSIONS_DIR, phone)
     proxy = await get_proxy_for_account(phone, owner_id)
     tproxy = proxy_to_telethon(proxy or "")
 
-    client = TelegramClient(session_path, API_ID, API_HASH, proxy=tproxy)
-    try:
-        await client.start()
-    except Exception as e:
-        log.warning("ldv start %s: %s", phone, e)
+    client = await _client_pool.get_or_connect(
+        phone, API_ID, API_HASH, SESSIONS_DIR, proxy=tproxy
+    )
+    if client is None:
+        log.warning("ldv start %s: connect failed", phone)
         await db.db_update_ldv_task(phone, status="error",
                                     next_run=time.time() + 600)
         return
@@ -319,10 +326,7 @@ async def ldv_liking_task(phone: str, owner_id: int, store,
         )
     finally:
         store.current_liking_phones.discard(phone)
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
+        # Клиент общий (client_pool) — не отключаем
 
 
 # =================================================================

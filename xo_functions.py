@@ -30,11 +30,15 @@ from telethon.tl.types import (
 )
 
 import db
+import client_pool as _client_pool
 from config import (
     API_ID, API_HASH, SESSIONS_DIR, XO_BOT,
     XO_PREMIUM_PHRASE, XO_PAUSE_SECONDS,
     XO_LIKE_INTERVAL, XO_CHECK_INTERVAL, XO_CHECK_LAST_N,
 )
+
+# Фразы-маркеры исчерпания лимита (ru + en)
+_XO_LIMIT_PHRASES = [XO_PREMIUM_PHRASE.lower(), "subscription is"]
 from global_proxy import proxy_to_telethon, get_proxy_for_account
 from reg_resume import XO_BTNS
 
@@ -469,13 +473,11 @@ async def register_one_xo(client: TelegramClient, phone: str,
             from telethon.tl.functions.messages import SendMediaRequest
             from telethon.tl.types import InputMediaContact
             bot_entity = await client.get_input_entity(bot)
-            me = await client.get_me()
             await client(SendMediaRequest(
                 peer=bot_entity,
                 media=InputMediaContact(
                     phone_number=str(phone),
                     first_name=name, last_name="", vcard="",
-                    user_id=me.id,
                 ),
                 message="",
                 random_id=random.randint(1, 2**62),
@@ -520,24 +522,26 @@ async def xo_liking_task(phone: str, owner_id: int,
     Уважает store.xo_liking_paused (set номеров).
     """
     bot = XO_BOT
-    session_path = os.path.join(SESSIONS_DIR, phone)
+    tproxy = proxy_to_telethon(proxy or "")
 
     while phone in store.xo_liking_tasks:
-        client = None
         try:
-            tproxy = proxy_to_telethon(proxy or "")
-            client = TelegramClient(session_path, API_ID, API_HASH,
-                                    proxy=tproxy)
-            await client.start()
+            # Используем общий клиент из пула — не создаём второй для того же session
+            client = await _client_pool.get_or_connect(
+                phone, API_ID, API_HASH, SESSIONS_DIR, proxy=tproxy
+            )
+            if client is None:
+                log.warning("xo_liking_task %s: connect failed, retry in 60s", phone)
+                await asyncio.sleep(60)
+                continue
+
             last_check = 0.0
 
             while phone in store.xo_liking_tasks:
-                # Пауза по запросу пользователя
                 if phone in store.xo_liking_paused:
                     await asyncio.sleep(5)
                     continue
 
-                # Отправляем "❤️"
                 try:
                     await client.send_message(bot, "❤️")
                 except FloodWaitError as e:
@@ -545,8 +549,8 @@ async def xo_liking_task(phone: str, owner_id: int,
                     await asyncio.sleep(min(e.seconds + 5, 600))
                 except Exception as e:
                     log.warning("xo like send %s: %s", phone, e)
+                    break  # выйти во внешний цикл для переподключения
 
-                # Раз в XO_CHECK_INTERVAL секунд проверяем лимит
                 now = time.time()
                 if now - last_check >= XO_CHECK_INTERVAL:
                     last_check = now
@@ -558,8 +562,7 @@ async def xo_liking_task(phone: str, owner_id: int,
                             (m.text or m.message or "").lower()
                             for m in msgs if m
                         )
-                        if XO_PREMIUM_PHRASE.lower() in joined:
-                            # Лимит исчерпан — пауза
+                        if any(p in joined for p in _XO_LIMIT_PHRASES):
                             until_ts = time.time() + XO_PAUSE_SECONDS
                             until_str = time.strftime(
                                 "%d.%m %H:%M", time.localtime(until_ts)
@@ -577,7 +580,6 @@ async def xo_liking_task(phone: str, owner_id: int,
                                     )
                                 except Exception:
                                     pass
-                            # ждём с проверкой отмены каждые 60с
                             wait_until = time.time() + XO_PAUSE_SECONDS
                             while time.time() < wait_until:
                                 if phone not in store.xo_liking_tasks:
@@ -595,16 +597,8 @@ async def xo_liking_task(phone: str, owner_id: int,
                 await asyncio.sleep(XO_LIKE_INTERVAL)
 
         except Exception as e:
-            log.warning("xo_liking_task %s outer error: %s", phone, e)
-        finally:
-            if client:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-
-        if phone in store.xo_liking_tasks:
-            await asyncio.sleep(30)   # подождать перед переподключением
+            log.warning("xo_liking_task %s error: %s", phone, e)
+            await asyncio.sleep(30)
 
     log.info("xo_liking_task %s stopped", phone)
 

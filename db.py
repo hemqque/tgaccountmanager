@@ -27,6 +27,10 @@ except Exception:
 # ─────────────────────────────────────────────────────────────────
 async def init_db() -> None:
     async with aiosqlite.connect(DB_NAME) as db:
+        # WAL-режим: параллельные читатели не блокируют писателей
+        await db.execute("PRAGMA journal_mode=WAL")
+        # Ждать до 5 сек вместо немедленного «database is locked»
+        await db.execute("PRAGMA busy_timeout=5000")
         await db.executescript(
             """
             CREATE TABLE IF NOT EXISTS accounts(

@@ -37,9 +37,6 @@ ACTIVE_CH = "🔷"
 OK_CH = "✅"
 ERR_CH = "❌"
 
-BAR_WIDTH = 14  # длина в символах
-
-
 # ─────────────────────────────────────────────────────────────────
 # Внутреннее: рендер сообщения
 # ─────────────────────────────────────────────────────────────────
@@ -49,8 +46,8 @@ def _render(state: dict) -> str:
     n_ok = max(0, done - len(state["errors"]))
     n_err = len(state["errors"])
 
-    # bar
-    width = BAR_WIDTH
+    # ширина бара = кол-во аккаунтов (по одной ячейке на каждый)
+    width = total
     n_ok_cells = round(width * n_ok / total)
     n_err_cells = round(width * n_err / total)
     if n_ok_cells + n_err_cells > width:
@@ -72,7 +69,7 @@ def _render(state: dict) -> str:
     ]
     cur = state.get("current")
     if cur:
-        lines.append(f"⚙️ В обработке: <code>{cur}</code>")
+        lines.append(f"⚙️ {cur}")
     if state["errors"]:
         last_errs = state["errors"][-5:]
         lines.append("⚠️ Ошибки:")
@@ -104,7 +101,7 @@ async def _safe_edit(bot: Bot, chat_id: int, message_id: int, text: str):
 async def _start_progress(bot: Bot, chat_id: int, uid: int, total: int,
                           store, title: str = "Прогресс") -> None:
     text = (f"⏳ <b>{title}</b>\n"
-            f"{WAIT_CH * BAR_WIDTH}  0/{total}  (0%)")
+            f"{WAIT_CH * total}  0/{total}  (0%)")
     msg = await bot.send_message(chat_id, text, parse_mode="HTML")
     pinned = False
     try:

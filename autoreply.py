@@ -22,9 +22,10 @@ from typing import Optional, Dict, Set, Callable, Awaitable, Tuple
 
 from telethon import TelegramClient, events
 
+import client_pool as _client_pool
 from autoreply_rules import AUTOREPLY_RULES, DEFAULT_REPLY_TEXT
 from config import API_ID, API_HASH, SESSIONS_DIR
-from global_proxy import proxy_to_telethon
+from global_proxy import proxy_to_telethon, get_proxy_for_account
 
 log = logging.getLogger("autoreply")
 
@@ -47,8 +48,6 @@ class AutoreplyManager:
     """Глобальный менеджер автоответов; одна инстанция на процесс."""
 
     def __init__(self, notify_owner: Optional[NotifyFn] = None):
-        # phone -> TelethonClient
-        self._clients: Dict[str, TelegramClient] = {}
         # phone -> timestamp до которого ничего не отвечаем
         self._frozen_until: Dict[str, float] = {}
         # phone -> set(chat_id), где автоответ навсегда замолчан
@@ -61,6 +60,10 @@ class AutoreplyManager:
         self._custom_text: Dict[str, Optional[str]] = {}
         # phone -> owner_id
         self._owners: Dict[str, int] = {}
+        # phone -> (on_in_fn, on_out_fn) — для удаления хендлеров при stop()
+        self._handlers: Dict[str, Tuple] = {}
+        # set активных телефонов (autoreply включён)
+        self._active: Set[str] = set()
         # callback "сообщить владельцу" — задаётся из main.py
         self._notify_owner: Optional[NotifyFn] = notify_owner
         # Лок для одновременных стартов одного и того же phone
@@ -73,7 +76,7 @@ class AutoreplyManager:
         self._notify_owner = fn
 
     def is_running(self, phone: str) -> bool:
-        return phone in self._clients
+        return phone in self._active
 
     def silenced_count(self, phone: str) -> int:
         return len(self._silenced_chats.get(phone, set()))
@@ -102,67 +105,71 @@ class AutoreplyManager:
                     ) -> bool:
         """
         Запустить автоответчик для аккаунта `phone`.
+        Использует глобальный client_pool — не создаёт дублирующий клиент.
         Возвращает True, если успешно стартовал/уже работал.
         """
         async with self._lock:
-            if phone in self._clients:
-                # уже работает — обновим owner/custom
+            if phone in self._active:
                 self._owners[phone] = owner_id
                 if custom_text is not None:
                     self._custom_text[phone] = custom_text
                 return True
 
-            session_path = os.path.join(SESSIONS_DIR, phone)
-            os.makedirs(SESSIONS_DIR, exist_ok=True)
             tproxy = proxy_to_telethon(proxy or "")
-
-            try:
-                client = TelegramClient(
-                    session_path, API_ID, API_HASH, proxy=tproxy
-                )
-                await client.connect()
-                if not await client.is_user_authorized():
-                    log.warning("autoreply.start: %s not authorized", phone)
-                    await client.disconnect()
-                    return False
-            except Exception as e:
-                log.warning("autoreply.start: %s connect failed: %s", phone, e)
+            client = await _client_pool.get_or_connect(
+                phone, API_ID, API_HASH, SESSIONS_DIR, proxy=tproxy
+            )
+            if client is None:
+                log.warning("autoreply.start: %s connect failed", phone)
                 return False
 
-            self._clients[phone] = client
             self._owners[phone] = owner_id
             self._silenced_chats.setdefault(phone, set())
             self._answered_blocks.setdefault(phone, {})
             self._default_sent.setdefault(phone, set())
             self._custom_text[phone] = custom_text
+            self._active.add(phone)
 
-            # обработчик входящих ЛС (включая исходящие — нам нужны оба)
-            @client.on(events.NewMessage(incoming=True))
+            # Регистрируем хендлеры и сохраняем ссылки для удаления при stop()
             async def _on_in(event):
                 if not event.is_private:
                     return
+                if phone not in self._active:
+                    return
                 await self._handle_message(phone, owner_id, event.message)
 
-            @client.on(events.NewMessage(outgoing=True))
             async def _on_out(event):
                 if not event.is_private:
                     return
+                if phone not in self._active:
+                    return
                 await self._handle_message(phone, owner_id, event.message)
+
+            client.add_event_handler(_on_in, events.NewMessage(incoming=True))
+            client.add_event_handler(_on_out, events.NewMessage(outgoing=True))
+            self._handlers[phone] = (_on_in, _on_out)
 
             return True
 
     async def stop(self, phone: str) -> None:
         async with self._lock:
-            client = self._clients.pop(phone, None)
+            self._active.discard(phone)
             self._owners.pop(phone, None)
-        if client:
+            handlers = self._handlers.pop(phone, None)
+
+        # Снимаем хендлеры с общего клиента (НЕ отключаем — клиент общий)
+        client = _client_pool.get(phone)
+        if client and handlers:
             try:
-                await client.disconnect()
+                client.remove_event_handler(handlers[0],
+                                            events.NewMessage(incoming=True))
+                client.remove_event_handler(handlers[1],
+                                            events.NewMessage(outgoing=True))
             except Exception:
                 pass
 
     async def stop_all(self) -> None:
-        for phone in list(self._clients.keys()):
+        for phone in list(self._active):
             await self.stop(phone)
 
     # ============================================================
@@ -201,9 +208,16 @@ class AutoreplyManager:
             text = (msg.text or msg.message or "")
             matched_reply, block_idx = self._match_reply(text)
 
-            client = self._clients.get(phone)
+            client = _client_pool.get(phone)
             if client is None:
                 return
+
+            # Сохраняем peer ДО сна — после переподключения кэш entity может
+            # быть очищен, и chat_id (int) перестаёт резолвиться
+            try:
+                peer = await msg.get_input_chat()
+            except Exception:
+                peer = chat_id
 
             if matched_reply is not None:
                 # уже отвечали этим блоком в этом чате?
@@ -225,10 +239,10 @@ class AutoreplyManager:
                     return
 
                 try:
-                    await client.send_message(chat_id, matched_reply)
+                    await client.send_message(peer, matched_reply)
                     answered.add(block_idx)
                     try:
-                        await client.send_read_acknowledge(chat_id)
+                        await client.send_read_acknowledge(peer)
                     except Exception:
                         pass
                 except Exception as e:
@@ -252,10 +266,10 @@ class AutoreplyManager:
                 default_text = (self._custom_text.get(phone)
                                 or DEFAULT_REPLY_TEXT)
                 try:
-                    await client.send_message(chat_id, default_text)
+                    await client.send_message(peer, default_text)
                     self._default_sent.setdefault(phone, set()).add(chat_id)
                     try:
-                        await client.send_read_acknowledge(chat_id)
+                        await client.send_read_acknowledge(peer)
                     except Exception:
                         pass
                 except Exception as e:

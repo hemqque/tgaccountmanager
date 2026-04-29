@@ -50,7 +50,7 @@ from utils import (
     is_allowed, restore_main_menu, ask_with_cancel, validate_phone,
     validate_proxy, safe_delete_folder, auto_join_channels, rand_sleep,
     main_menu_keyboard, attach_pending_router, has_pending,
-    register_pending_text,
+    register_pending_text, cancel_pending_ask,
 )
 from store import Store
 from task_queue import TaskQueue
@@ -103,13 +103,11 @@ task_queue = TaskQueue(max_concurrent=config.MAX_CONCURRENT_TASKS)
 # Менеджер автоответов
 ar_manager = AutoreplyManager()
 
-# Глобальные кеши Telethon-клиентов (для управления аккаунтами:
-# редактирование профиля, получение кода и пр.).
-# Ключ — phone, значение — TelegramClient.
-_account_clients: Dict[str, TelegramClient] = {}
+import client_pool as _client_pool
 
 # Сессии добавления аккаунта (ввод кода/пароля): uid -> dict
 _signin_sessions: Dict[int, Dict[str, Any]] = {}
+_batch_cancel: Dict[int, bool] = {}
 
 
 # =================================================================
@@ -138,33 +136,16 @@ async def get_or_create_account_client(phone: str,
                                        ) -> Optional[TelegramClient]:
     """
     Возвращает уже подключённый Telethon-клиент для аккаунта `phone`.
-    При первом обращении создаёт его (с прокси из БД), connect+авторизация.
+    Использует глобальный client_pool — один клиент на телефон.
     """
-    cli = _account_clients.get(phone)
-    if cli and cli.is_connected():
-        return cli
     proxy = await get_proxy_for_account(
         phone, owner_id if owner_id is not None else 0
     )
     tproxy = proxy_to_telethon(proxy or "")
-    session_path = os.path.join(config.SESSIONS_DIR, phone)
-    os.makedirs(config.SESSIONS_DIR, exist_ok=True)
-    cli = TelegramClient(session_path, config.API_ID, config.API_HASH,
-                         proxy=tproxy)
-    try:
-        await cli.connect()
-        if not await cli.is_user_authorized():
-            await cli.disconnect()
-            return None
-    except Exception as e:
-        log.warning("get_or_create_account_client(%s): %s", phone, e)
-        try:
-            await cli.disconnect()
-        except Exception:
-            pass
-        return None
-    _account_clients[phone] = cli
-    return cli
+    return await _client_pool.get_or_connect(
+        phone, config.API_ID, config.API_HASH, config.SESSIONS_DIR,
+        proxy=tproxy,
+    )
 
 
 def kb(*rows) -> InlineKeyboardMarkup:
@@ -490,10 +471,12 @@ async def cb_acc_add(cb: CallbackQuery):
                                     "Отменено.")
             return
         phones = []
-        for tok in re.split(r"[,\n;\s]+", raw):
-            p = validate_phone(tok)
-            if p:
-                phones.append(p)
+        for tok in re.split(r"[,\n;]+", raw):
+            tok = tok.strip()
+            if tok:
+                p = validate_phone(tok)
+                if p:
+                    phones.append(p)
         # дедуп
         phones = list(dict.fromkeys(phones))
         if not phones:
@@ -501,7 +484,15 @@ async def cb_acc_add(cb: CallbackQuery):
             await restore_main_menu(bot, cb.message.chat.id, uid)
             return
 
-        await bot.send_message(uid, f"🔄 К обработке: {len(phones)} номер(ов).")
+        _batch_cancel[uid] = False
+        cancel_msg = await bot.send_message(
+            cb.message.chat.id,
+            f"🔄 К обработке: {len(phones)} номер(ов).",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="❌ Отменить всё",
+                                     callback_data="acc_add_cancel")
+            ]]),
+        )
 
         async def _run_add():
             await _start_progress(bot, cb.message.chat.id, uid,
@@ -509,6 +500,8 @@ async def cb_acc_add(cb: CallbackQuery):
                                   title="➕ Добавление аккаунтов")
             ok_count = 0
             for ph in phones:
+                if _batch_cancel.get(uid):
+                    break
                 await _update_progress(bot, uid, store, current=ph)
                 try:
                     res = await _add_one_account(uid, cb.message.chat.id, ph)
@@ -522,9 +515,15 @@ async def cb_acc_add(cb: CallbackQuery):
                     await _update_progress(bot, uid, store, done_inc=1,
                                            current=None,
                                            error=f"{ph}: {e}")
+            _batch_cancel.pop(uid, None)
+            try:
+                await cancel_msg.delete()
+            except Exception:
+                pass
+            cancelled_note = " (отменено)" if _batch_cancel.get(uid) else ""
             await _finish_progress(bot, uid, store,
                                    summary_extra=f"Добавлено: {ok_count}/"
-                                                 f"{len(phones)}")
+                                                 f"{len(phones)}{cancelled_note}")
             await restore_main_menu(bot, cb.message.chat.id, uid)
 
         await task_queue.submit(
@@ -550,7 +549,8 @@ async def _add_one_account(uid: int, chat_id: int, phone: str) -> bool:
         await bot.send_message(uid, f"❌ {phone}: некорректный прокси.")
         return False
     if proxy_raw.strip().lower() in ("нет", "no", "none", "-", "без прокси"):
-        proxy_str = ""
+        g = await get_sticky_global_proxy(phone)
+        proxy_str = g["proxy_str"] if g else ""
     else:
         proxy_str = proxy_raw.strip()
 
@@ -610,12 +610,14 @@ async def _add_one_account(uid: int, chat_id: int, phone: str) -> bool:
         rows.append([("➕ Новая группа", f"acc_grpnew:{phone}")])
         rows.append([("❌ Без группы", f"acc_grpset:{phone}:")])
         rows.append([home_btn()])
-        # сохраняем «черновик» аккаунта
+        # сохраняем «черновик» аккаунта и ждём выбор группы
+        grp_event = asyncio.Event()
         _signin_sessions[uid] = {
             "phone": phone,
             "proxy": proxy_str,
             "username": username,
             "chat_id": chat_id,
+            "event": grp_event,
         }
         await bot.send_message(
             chat_id,
@@ -623,8 +625,12 @@ async def _add_one_account(uid: int, chat_id: int, phone: str) -> bool:
             f"(@{username or '-'}). Выберите группу:",
             reply_markup=kb(*rows),
         )
-        # ждём callback от пользователя — реализован отдельным хендлером
         await client.disconnect()
+        # ждём пока пользователь выберет группу (макс 10 минут)
+        try:
+            await asyncio.wait_for(grp_event.wait(), timeout=600)
+        except asyncio.TimeoutError:
+            _signin_sessions.pop(uid, None)
         return True
     except Exception as e:
         log.warning("add account %s: %s", phone, e)
@@ -634,6 +640,18 @@ async def _add_one_account(uid: int, chat_id: int, phone: str) -> bool:
             pass
         await bot.send_message(uid, f"❌ {phone}: {e}")
         return False
+
+
+@dp.callback_query(F.data == "acc_add_cancel")
+async def cb_acc_add_cancel(cb: CallbackQuery):
+    uid = cb.from_user.id
+    _batch_cancel[uid] = True
+    cancel_pending_ask(uid)
+    await cb.answer("⛔ Добавление отменено.", show_alert=True)
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 
 @dp.callback_query(F.data.startswith("acc_grpset:"))
@@ -648,9 +666,12 @@ async def cb_acc_grpset(cb: CallbackQuery):
     sess = _signin_sessions.get(uid) or {}
     proxy = sess.get("proxy", "")
     username = sess.get("username", "")
+    event = sess.get("event")
     note = ""
     await db.db_add_account(phone, proxy, note, grp, username, uid)
     _signin_sessions.pop(uid, None)
+    if event:
+        event.set()
     await cb.message.edit_text(
         f"✅ <code>{phone}</code> сохранён в группу: "
         f"<b>{grp or '— без группы —'}</b>"
@@ -671,8 +692,11 @@ async def cb_acc_grpnew(cb: CallbackQuery):
     sess = _signin_sessions.get(uid) or {}
     proxy = sess.get("proxy", "")
     username = sess.get("username", "")
+    event = sess.get("event")
     await db.db_add_account(phone, proxy, "", name, username, uid)
     _signin_sessions.pop(uid, None)
+    if event:
+        event.set()
     await cb.message.answer(
         f"✅ <code>{phone}</code> сохранён в группу: <b>{name}</b>"
     )
@@ -761,6 +785,9 @@ async def handle_document(msg: Message):
                 )
             except Exception as e:
                 await bot.send_message(uid, f"❌ Импорт сессий упал: {e}")
+                store.set_action(uid, None)
+                _tdata_sessions.pop(uid, None)
+                await restore_main_menu(bot, chat_id, uid)
                 return
             await _write_session_report(
                 uid, results, "📥 Импорт сессий завершён"
@@ -795,6 +822,9 @@ async def handle_document(msg: Message):
             )
         except Exception as e:
             await bot.send_message(uid, f"❌ Импорт TData упал: {e}")
+            store.set_action(uid, None)
+            _tdata_sessions.pop(uid, None)
+            await restore_main_menu(bot, chat_id, uid)
             return
 
         ok_count = 0
@@ -878,6 +908,7 @@ async def cb_acc_tdata_local(cb: CallbackQuery):
                                show_alert=True)
     store.set_action(uid, "acc_tdata_local")
     await cb.answer()
+    _confirmed = False
     try:
         path_raw = await ask_with_cancel(
             bot, cb.message.chat.id, uid,
@@ -953,6 +984,7 @@ async def cb_acc_tdata_local(cb: CallbackQuery):
             "chat_id": cb.message.chat.id,
             "local_path": local_path,
         }
+        _confirmed = True
         await bot.send_message(
             cb.message.chat.id,
             "\n".join(preview_lines)
@@ -963,8 +995,8 @@ async def cb_acc_tdata_local(cb: CallbackQuery):
             ),
         )
     finally:
-        # set_action не сбрасываем — ждём подтверждения
-        pass
+        if not _confirmed:
+            store.set_action(uid, None)
 
 
 @dp.callback_query(F.data == "acc_tdata_local_run")
@@ -989,6 +1021,9 @@ async def cb_acc_tdata_local_run(cb: CallbackQuery):
             )
         except Exception as e:
             await bot.send_message(uid, f"❌ Импорт TData упал: {e}")
+            store.set_action(uid, None)
+            _tdata_sessions.pop(uid, None)
+            await restore_main_menu(bot, chat_id, uid)
             return
 
         ok_count = 0
@@ -1079,6 +1114,7 @@ async def cb_acc_session_local(cb: CallbackQuery):
                                show_alert=True)
     store.set_action(uid, "acc_session_local")
     await cb.answer()
+    _confirmed = False
     try:
         path_raw = await ask_with_cancel(
             bot, cb.message.chat.id, uid,
@@ -1127,6 +1163,7 @@ async def cb_acc_session_local(cb: CallbackQuery):
             "chat_id": cb.message.chat.id,
             "local_path": local_path,
         }
+        _confirmed = True
         await bot.send_message(
             cb.message.chat.id,
             "\n".join(preview_lines)
@@ -1137,7 +1174,8 @@ async def cb_acc_session_local(cb: CallbackQuery):
             ),
         )
     finally:
-        pass
+        if not _confirmed:
+            store.set_action(uid, None)
 
 
 @dp.callback_query(F.data == "acc_session_local_run")
@@ -1163,6 +1201,9 @@ async def cb_acc_session_local_run(cb: CallbackQuery):
             )
         except Exception as e:
             await bot.send_message(uid, f"❌ Импорт упал: {e}")
+            store.set_action(uid, None)
+            _tdata_sessions.pop(uid, None)
+            await restore_main_menu(bot, chat_id, uid)
             return
         await _write_session_report(uid, results, "📥 Локальный импорт сессий")
         store.set_action(uid, None)
@@ -1651,13 +1692,8 @@ async def cb_acc_del2(cb: CallbackQuery):
         t.cancel()
     # отметить как cancelled для LDV
     store.cancelled_phones.add(phone)
-    # удалить из кеша клиентов
-    cli = _account_clients.pop(phone, None)
-    if cli:
-        try:
-            await cli.disconnect()
-        except Exception:
-            pass
+    # удалить клиент из общего пула
+    await _client_pool.remove(phone)
     # удалить из БД
     await db.db_delete_account(phone)
     # стереть .session
@@ -2334,22 +2370,45 @@ async def cb_ldvr_photodone(cb: CallbackQuery):
                               total=len(targets), store=store,
                               title="🤖 Рега ЛДВ")
         success = []
-        for ph in targets:
+
+        # Перемешиваем списки один раз — города и имена не повторяются
+        # до исчерпания списка, затем начинают цикл заново
+        ages_list   = list(d.get("ages")   or ["20"])
+        cities_list = list(d.get("cities") or ["Москва"])
+        names_list  = list(d.get("names")  or ["Аня"])
+        random.shuffle(ages_list)
+        random.shuffle(cities_list)
+        random.shuffle(names_list)
+
+        for i, ph in enumerate(targets):
             if ph in store.ldv_reg_cancel:
                 store.ldv_reg_cancel.discard(ph)
                 await _update_progress(bot, uid, store, done_inc=1,
                                        error=f"{ph}: отменено")
                 continue
-            await _update_progress(bot, uid, store, current=ph)
+            await _update_progress(bot, uid, store,
+                                   current=f"{ph} — подключение…")
             try:
                 cli = await get_or_create_account_client(ph, uid)
                 if not cli:
                     raise RuntimeError("connect failed")
+
+                # Назначаем уникальные (без повторов до конца списка) данные
+                per_acc = dict(d)
+                per_acc.pop("ages", None)
+                per_acc.pop("cities", None)
+                per_acc.pop("names", None)
+                per_acc["age"]  = str(ages_list[i % len(ages_list)])
+                per_acc["city"] = cities_list[i % len(cities_list)]
+                per_acc["name"] = names_list[i % len(names_list)]
+
+                await _update_progress(bot, uid, store,
+                                       current=f"{ph} — регистрация…")
                 # пытаемся возобновить, если в reg_state есть состояние
                 state = await db.db_get_reg_state(ph, config.LDV_BOT)
                 if state:
                     ok = await register_ldv_resumable(
-                        cli, ph, dict(d), uid,
+                        cli, ph, per_acc, uid,
                         notify_func=lambda t, _u=uid:
                             user_log(_u, t),
                         photos_request_func=None,
@@ -2357,7 +2416,7 @@ async def cb_ldvr_photodone(cb: CallbackQuery):
                     )
                 else:
                     ok = await register_one_ldv(
-                        cli, ph, dict(d),
+                        cli, ph, per_acc,
                         notify_func=lambda t, _u=uid:
                             user_log(_u, t),
                         owner_id=uid,
@@ -2445,8 +2504,10 @@ async def cb_xor_t(cb: CallbackQuery):
     if len(lines) < 4:
         return await bot.send_message(uid, "❌ Нужно 4 непустых строк.")
     store.xo_data[uid].update({
-        "sex": lines[0], "birthday": lines[1],
-        "city": lines[2], "name": lines[3],
+        "sex":      lines[0],
+        "birthday": lines[1],
+        "cities":   [c.strip() for c in lines[2].split(",") if c.strip()],
+        "names":    [n.strip() for n in lines[3].split(",") if n.strip()],
     })
     store.photo_collecting[uid] = True
     store.clear_temp_photos(uid)
@@ -2487,26 +2548,44 @@ async def cb_xor_photodone(cb: CallbackQuery):
                               total=len(targets), store=store,
                               title="💘 Рега XO")
         success = []
-        for ph in targets:
+
+        # Перемешиваем списки один раз — без повторов до исчерпания
+        cities_list = list(d.get("cities") or [d.get("city") or "Москва"])
+        names_list  = list(d.get("names")  or [d.get("name")  or "Аня"])
+        random.shuffle(cities_list)
+        random.shuffle(names_list)
+
+        for i, ph in enumerate(targets):
             if ph in store.xo_reg_cancel:
                 await _update_progress(bot, uid, store, done_inc=1,
                                        error=f"{ph}: отменено")
                 continue
-            await _update_progress(bot, uid, store, current=ph)
+            await _update_progress(bot, uid, store,
+                                   current=f"{ph} — подключение…")
             try:
                 cli = await get_or_create_account_client(ph, uid)
                 if not cli:
                     raise RuntimeError("connect failed")
+
+                # Назначаем уникальные данные для этого аккаунта
+                per_acc = dict(d)
+                per_acc.pop("cities", None)
+                per_acc.pop("names", None)
+                per_acc["city"] = cities_list[i % len(cities_list)]
+                per_acc["name"] = names_list[i % len(names_list)]
+
+                await _update_progress(bot, uid, store,
+                                       current=f"{ph} — регистрация…")
                 state = await db.db_get_reg_state(ph, config.XO_BOT)
                 if state:
                     ok = await register_xo_resumable(
-                        cli, ph, dict(d), uid,
+                        cli, ph, per_acc, uid,
                         notify_func=lambda t, _u=uid: user_log(_u, t),
                         cancel_set=store.xo_reg_cancel,
                     )
                 else:
                     ok = await register_one_xo(
-                        cli, ph, dict(d),
+                        cli, ph, per_acc,
                         notify_func=lambda t, _u=uid: user_log(_u, t),
                         cancel_set=store.xo_reg_cancel,
                         owner_id=uid,
@@ -3576,13 +3655,9 @@ async def _on_shutdown():
         store.xo_liking_tasks.pop(ph, None)
         if not t.done():
             t.cancel()
-    # отключим всех клиентов
-    for ph, cli in list(_account_clients.items()):
-        try:
-            await cli.disconnect()
-        except Exception:
-            pass
-        _account_clients.pop(ph, None)
+    # отключим всех клиентов из пула
+    for ph in _client_pool.all_phones():
+        await _client_pool.remove(ph)
     try:
         await bot.session.close()
     except Exception:

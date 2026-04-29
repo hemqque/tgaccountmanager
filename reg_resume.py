@@ -305,7 +305,6 @@ async def register_ldv_resumable(
         if detected <= 10:
             if _is_cancel(): return False
             try:
-                me = await client.get_me()
                 await client.send_message(
                     bot,
                     file=__import__("telethon").tl.types.InputMediaContact(
@@ -313,7 +312,6 @@ async def register_ldv_resumable(
                         first_name=name,
                         last_name="",
                         vcard="",
-                        user_id=me.id,
                     )
                 )
             except Exception:
@@ -544,13 +542,11 @@ async def register_xo_resumable(
                 from telethon.tl.functions.messages import SendMediaRequest
                 from telethon.tl.types import InputMediaContact
                 bot_entity = await client.get_input_entity(bot)
-                me = await client.get_me()
                 await client(SendMediaRequest(
                     peer=bot_entity,
                     media=InputMediaContact(
                         phone_number=str(phone),
                         first_name=name, last_name="", vcard="",
-                        user_id=me.id,
                     ),
                     message="",
                     random_id=random.randint(1, 2**62),
