@@ -39,6 +39,29 @@ _ldv_listeners: set = set()
 log = logging.getLogger("ldv")
 
 
+def _find_reply_button(msg, search_text: str) -> Optional[str]:
+    """
+    Ищет кнопку reply-клавиатуры в сообщении Telethon, текст которой
+    содержит search_text (регистронезависимо).
+    Возвращает точный текст кнопки или None.
+    """
+    try:
+        markup = getattr(msg, "reply_markup", None)
+        if markup is None:
+            return None
+        rows = getattr(markup, "rows", None)
+        if not rows:
+            return None
+        for row in rows:
+            for btn in (getattr(row, "buttons", None) or []):
+                btn_text = getattr(btn, "text", "") or ""
+                if search_text.lower() in btn_text.lower():
+                    return btn_text
+    except Exception:
+        pass
+    return None
+
+
 # =================================================================
 # register_one_ldv — полная регистрация
 # =================================================================
@@ -333,6 +356,21 @@ async def ldv_liking_task(phone: str, owner_id: int, store,
                             except Exception:
                                 pass
                         break
+                    elif "больше внимания" in text:
+                        # Бот предлагает «бустнуть» — отказываемся.
+                        # Ищем кнопку «В другой раз» в reply-клавиатуре;
+                        # если её нет — просто отправляем текст.
+                        btn = _find_reply_button(msg, "в другой раз")
+                        reply_text = btn if btn else "В другой раз"
+                        log.debug("ldv 'больше внимания' %s → '%s'",
+                                  phone, reply_text)
+                        try:
+                            await client.send_message(bot, reply_text)
+                        except Exception as e:
+                            log.warning("ldv attention-reply %s: %s",
+                                        phone, e)
+                        # ждём следующий ответ бота после нашего нажатия
+                        await _wait_ldv_msg(phone, store, LDV_RESPONSE_TIMEOUT)
                 await asyncio.sleep(random.uniform(2, 5))
 
             # ── 3. Шагаем step и считаем next_run ──
