@@ -257,7 +257,18 @@ async def _callback_guard_mw(handler, event: CallbackQuery, data):
 async def handle_start(msg: Message):
     uid = msg.from_user.id
     is_admin = await db.db_admins_check(uid)
-    text = "Добро пожаловать в менеджер аккаунтов."
+    name = msg.from_user.first_name or "друг"
+    text = (
+        f"👋 <b>Привет, {name}!</b>\n\n"
+        "Добро пожаловать в <b>менеджер аккаунтов</b> — "
+        "твой инструмент для управления фермой Telegram.\n\n"
+        "📌 Что умеет бот:\n"
+        "  • Добавлять и импортировать аккаунты\n"
+        "  • Регистрировать в LDV и XO\n"
+        "  • Управлять лайкингом и автоответами\n"
+        "  • Массово менять имена, фото, био\n\n"
+        "Выбери раздел ниже 👇"
+    )
     await msg.answer(text, reply_markup=main_menu_keyboard(is_admin))
 
 
@@ -289,17 +300,18 @@ async def cb_action_cancel(cb: CallbackQuery):
 @dp.message(F.text == "⚙️ Аккаунты")
 async def handle_section_accounts(msg: Message):
     await msg.answer(
-        "⚙️ <b>Аккаунты</b>",
+        "⚙️ <b>Аккаунты</b>\n\n"
+        "Добавляйте аккаунты вручную или импортируйте "
+        "из TData / .session-файлов.",
         reply_markup=kb(
             [("➕ Добавить аккаунт", "acc_add")],
-            [("📦 Импорт TData (ZIP)", "acc_tdata"),
-             ("📂 Импорт TData (папка)", "acc_tdata_local")],
-            [("📥 Импорт сессий (ZIP)", "acc_session_zip"),
-             ("📥 Импорт сессий (папка)", "acc_session_local")],
-            [("📱 Мои аккаунты", "acc_list:0")],
-            [("🔑 Мои прокси", "px_list")],
-            [("📡 Применить глобал к моим без-прокси",
-              "acc_apply_global")],
+            [("📦 TData (ZIP)", "acc_tdata"),
+             ("📂 TData (папка)", "acc_tdata_local")],
+            [("📥 Сессии (ZIP)", "acc_session_zip"),
+             ("📥 Сессии (папка)", "acc_session_local")],
+            [("📱 Мои аккаунты", "acc_list:0"),
+             ("🔑 Мои прокси", "px_list")],
+            [("📡 Применить глобальные прокси", "acc_apply_global")],
             [home_btn()],
         ),
     )
@@ -326,12 +338,14 @@ async def cb_acc_apply_global(cb: CallbackQuery):
 @dp.message(F.text == "🤖 Автоматизация")
 async def handle_section_auto(msg: Message):
     await msg.answer(
-        "🤖 <b>Автоматизация</b>",
+        "🤖 <b>Автоматизация</b>\n\n"
+        "Массовые операции над аккаунтами: заливка профилей, "
+        "регистрация в приложениях, автоответы.",
         reply_markup=kb(
             [("🚀 Массовый залив", "auto_mass")],
-            [("🤖 Рега ЛДВ", "auto_ldv")],
-            [("💘 Рега XO", "auto_xo")],
-            [("📺 Подписка на ДВ", "auto_subdv")],
+            [("🤖 Регистрация LDV", "auto_ldv"),
+             ("💘 Регистрация XO", "auto_xo")],
+            [("📺 Подписка @leoday", "auto_subdv")],
             [("💬 Автоответы", "auto_ar")],
             [home_btn()],
         ),
@@ -341,12 +355,14 @@ async def handle_section_auto(msg: Message):
 @dp.message(F.text == "📊 Управление")
 async def handle_section_manage(msg: Message):
     await msg.answer(
-        "📊 <b>Управление</b>",
+        "📊 <b>Управление</b>\n\n"
+        "Ручной запуск лайкинга, управление задачами "
+        "и отмена регистраций.",
         reply_markup=kb(
-            [("❤️ Ручной пролайк ДВ", "mng_manual_ldv")],
-            [("💘 Ручной пролайк XO", "mng_manual_xo")],
-            [("⚙️ Управление лайкингом ДВ", "mng_ldv")],
-            [("💘 Управление XO", "mng_xo_panel")],
+            [("❤️ Пролайк LDV", "mng_manual_ldv"),
+             ("💘 Пролайк XO", "mng_manual_xo")],
+            [("⚙️ Задачи LDV", "mng_ldv"),
+             ("💘 Задачи XO", "mng_xo_panel")],
             [("🛑 Отмена регистрации", "mng_regcancel")],
             [home_btn()],
         ),
@@ -363,24 +379,27 @@ async def handle_section_progress(msg: Message):
     user_settings = await db.db_user_settings_get(uid)
     logs_on = bool(user_settings.get("logs_enabled"))
 
+    ldv_run  = sum(1 for t in ldv_tasks if t["status"] == "running")
+    ldv_pend = sum(1 for t in ldv_tasks if t["status"] == "pending")
+    xo_run   = sum(1 for t in xo_tasks  if t["status"] == "running")
+    xo_paus  = sum(1 for t in xo_tasks  if t["status"] == "paused")
     text = (
-        "📈 <b>Прогресс</b>\n\n"
-        f"👤 Аккаунтов: <b>{len(accs)}</b>\n"
-        f"🤖 LDV-задач: <b>{len(ldv_tasks)}</b> "
-        f"(running: {sum(1 for t in ldv_tasks if t['status']=='running')}, "
-        f"pending: {sum(1 for t in ldv_tasks if t['status']=='pending')})\n"
-        f"💘 XO-задач: <b>{len(xo_tasks)}</b> "
-        f"(running: {sum(1 for t in xo_tasks if t['status']=='running')}, "
-        f"paused: {sum(1 for t in xo_tasks if t['status']=='paused')})\n"
-        f"⚙️ Очередь: running={s['running']}, waiting={s['waiting']}, "
-        f"max={s['max']}\n"
-        f"📋 Логи: {'✅ Вкл' if logs_on else '❌ Выкл'}"
+        "📈 <b>Прогресс и статистика</b>\n\n"
+        f"👤  Аккаунтов:   <b>{len(accs)}</b>\n\n"
+        f"🤖  LDV-задач:   <b>{len(ldv_tasks)}</b>\n"
+        f"    ▸ активных: {ldv_run}  ▸ ожидают: {ldv_pend}\n\n"
+        f"💘  XO-задач:    <b>{len(xo_tasks)}</b>\n"
+        f"    ▸ активных: {xo_run}  ▸ на паузе: {xo_paus}\n\n"
+        f"⚙️  Очередь задач:  "
+        f"активно {s['running']} / ожидает {s['waiting']} / макс. {s['max']}\n\n"
+        f"📋  Логи уведомлений: "
+        f"{'✅ включены' if logs_on else '❌ выключены'}"
     )
+    logs_btn_text = "📋 Выключить логи" if logs_on else "📋 Включить логи"
     await msg.answer(
         text,
         reply_markup=kb(
-            [(("📋 Логи: Выкл" if logs_on else "📋 Логи: Вкл"),
-              "prog_logs_toggle")],
+            [(logs_btn_text, "prog_logs_toggle")],
             [home_btn()],
         ),
     )
@@ -400,12 +419,14 @@ async def handle_section_admin(msg: Message):
     if not await db.db_admins_check(msg.from_user.id):
         return await msg.answer("⛔ Нет доступа.")
     await msg.answer(
-        "👑 <b>Админ-панель</b>",
+        "👑 <b>Администрирование</b>\n\n"
+        "Управление доступом пользователей, "
+        "глобальными прокси и просмотр всех аккаунтов.",
         reply_markup=kb(
-            [("👥 Whitelist", "adm_wl")],
-            [("👮 Админы", "adm_admins")],
-            [("🌐 Глобальные прокси", "gpx_list")],
-            [("📋 Все аккаунты", "adm_all_accs")],
+            [("👥 Whitelist", "adm_wl"),
+             ("👮 Администраторы", "adm_admins")],
+            [("🌐 Глобальные прокси", "gpx_list"),
+             ("📋 Все аккаунты", "adm_all_accs")],
             [home_btn()],
         ),
     )
@@ -493,9 +514,9 @@ async def cb_acc_add(cb: CallbackQuery):
         _batch_cancel[uid] = False
         cancel_msg = await bot.send_message(
             cb.message.chat.id,
-            f"🔄 К обработке: {len(phones)} номер(ов).",
+            f"📋 <b>Добавление аккаунтов</b>\n\nВ очереди: <b>{len(phones)}</b> номеров",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="❌ Отменить всё",
+                InlineKeyboardButton(text="🛑 Прервать добавление",
                                      callback_data="acc_add_cancel")
             ]]),
         )
@@ -1342,8 +1363,11 @@ async def cb_acc_list(cb: CallbackQuery):
         rows.append(nav)
     rows.append([("♻️ Сбросить все сессии", "acc_reset_all")])
     rows.append([home_btn()])
-    text = (f"📱 <b>Мои аккаунты</b>: {total} шт.\n"
-            f"Страница {page+1}/{pages}")
+    text = (
+        f"📱 <b>Мои аккаунты</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Всего: <b>{total}</b>  ·  Стр. {page+1}/{pages}"
+    )
     try:
         await cb.message.edit_text(text, reply_markup=kb(*rows))
     except TelegramBadRequest:
@@ -1362,13 +1386,18 @@ async def cb_acc_reset_all(cb: CallbackQuery):
     await cb.answer()
     confirm = await ask_with_retry(
         bot, cb.message.chat.id, uid,
-        "⚠️ Удалить ВСЕ сессии и аккаунты? Напишите <b>ДА</b>.",
+        "⚠️ <b>Удалить ВСЕ аккаунты?</b>\n\n"
+        "Это действие безвозвратно удалит:\n"
+        "  • все .session-файлы\n"
+        "  • все записи в базе данных\n"
+        "  • все задачи LDV и XO\n\n"
+        "Для подтверждения напишите <b>ДА</b>:",
         validator=lambda t: t.strip().lower() == "да",
-        error_msg='❌ Напишите именно "ДА".',
+        error_msg='❌ Напишите именно "ДА" для подтверждения.',
         parse_mode="HTML",
     )
     if not confirm:
-        return await cb.message.answer("Отменено.")
+        return await cb.message.answer("✅ Отменено — аккаунты не удалены.")
     import glob as _glob
     accs = await db.db_get_accounts_by_owner(uid)
     n = 0
@@ -1410,23 +1439,26 @@ async def _render_account_card(phone: str, owner_id: int):
         else:
             proxy_line = "— без прокси —"
 
+    un = a.get("username") or "—"
     text = (
-        f"📱 <code>{a['phone']}</code> (@{a.get('username') or '-'})\n"
-        f"📝 {a.get('note') or '—'}\n"
-        f"📁 {a.get('grp') or '—'}\n"
-        f"🛡 {proxy_line}\n"
-        f"💬 Автоответ: {'✅' if ar_on else '❌'}"
+        f"📱 <b>{a['phone']}</b>  (@{un})\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📁  Группа:    <b>{a.get('grp') or '—'}</b>\n"
+        f"📝  Заметка:   {a.get('note') or '—'}\n"
+        f"🛡️  Прокси:    {proxy_line}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💬  Автоответ: {'✅ включён' if ar_on else '❌ выключен'}"
     )
     rows = [
-        [("✏️ Заметка", f"acc_note:{phone}"),
-         ("🔄 Группа", f"acc_grp:{phone}")],
         [("✏️ Имя", f"acc_name:{phone}"),
-         ("✏️ Био", f"acc_bio:{phone}")],
-        [("📷 Фото", f"acc_photo:{phone}"),
+         ("✏️ Био", f"acc_bio:{phone}"),
          ("✏️ Username", f"acc_uname:{phone}")],
-        [("🔒 Приватность", f"acc_priv:{phone}")],
-        [("📨 Получить код", f"acc_code:{phone}")],
-        [("🗑 Удалить", f"acc_del:{phone}")],
+        [("📷 Фото", f"acc_photo:{phone}"),
+         ("📝 Заметка", f"acc_note:{phone}"),
+         ("📁 Группа", f"acc_grp:{phone}")],
+        [("🔒 Приватность", f"acc_priv:{phone}"),
+         ("📨 Получить код", f"acc_code:{phone}")],
+        [("🗑 Удалить аккаунт", f"acc_del:{phone}")],
         [("‹ Назад", "acc_list:0"), home_btn()],
     ]
     return text, kb(*rows)
@@ -1635,10 +1667,13 @@ async def cb_acc_priv(cb: CallbackQuery):
     phone = cb.data.split(":", 1)[1]
     await cb.answer()
     await cb.message.answer(
-        f"🔒 Приватность для <code>{phone}</code>:",
+        f"🔒 <b>Приватность</b>  <code>{phone}</code>\n\n"
+        "Настройте видимость профиля для других пользователей.\n"
+        "Затрагивает: статус, фото, звонки, голосовые, переадресации, "
+        "номер телефона, инвайты в чаты.",
         reply_markup=kb(
-            [("🔒 Закрыть всё", f"acc_privset:{phone}:close")],
-            [("🔓 Открыть всё", f"acc_privset:{phone}:open")],
+            [("🔒 Закрыть всё", f"acc_privset:{phone}:close"),
+             ("🔓 Открыть всё", f"acc_privset:{phone}:open")],
             [("‹ Назад", f"acc_card:{phone}")],
         ),
     )
@@ -1715,10 +1750,15 @@ async def cb_acc_del(cb: CallbackQuery):
     phone = cb.data.split(":", 1)[1]
     await cb.answer()
     await cb.message.answer(
-        f"⚠️ Удалить <code>{phone}</code>? Все задачи и сессия будут стёрты.",
+        f"⚠️ <b>Удалить аккаунт?</b>\n\n"
+        f"<code>{phone}</code>\n\n"
+        "Будут безвозвратно удалены:\n"
+        "• .session-файл\n"
+        "• Задачи LDV и XO\n"
+        "• Настройки автоответа",
         reply_markup=kb(
-            [("✅ Да, удалить", f"acc_del2:{phone}")],
-            [("‹ Отмена", f"acc_card:{phone}")],
+            [("🗑 Да, удалить", f"acc_del2:{phone}")],
+            [("← Отмена", f"acc_card:{phone}")],
         ),
     )
 
@@ -1761,28 +1801,38 @@ async def cb_acc_del2(cb: CallbackQuery):
 async def cb_px_list(cb: CallbackQuery):
     uid = cb.from_user.id
     proxies = await db.db_proxy_get_by_owner(uid)
+    alive = sum(1 for p in proxies if p.get("status") == "alive")
+    dead  = sum(1 for p in proxies if p.get("status") == "dead")
     if not proxies:
-        text = "🔑 У вас нет прокси."
+        text = (
+            "🔑 <b>Мои прокси</b>\n"
+            "━━━━━━━━━━━━━━━━━━━\n"
+            "Прокси не добавлены."
+        )
     else:
-        lines = ["🔑 <b>Мои прокси</b>:"]
-        for p in proxies:
+        text = (
+            f"🔑 <b>Мои прокси</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"Всего: <b>{len(proxies)}</b>  ·  "
+            f"✅ {alive}  ·  ❌ {dead}\n"
+        )
+        for p in proxies[:20]:
             mark = ("✅" if p.get("status") == "alive"
                     else "❌" if p.get("status") == "dead" else "❓")
-            lines.append(
-                f"{mark} #{p['id']} — <code>{p['proxy_str']}</code>"
-                + (f" — {p['note']}" if p.get('note') else "")
-            )
-        text = "\n".join(lines)
+            note = f" — <i>{p['note']}</i>" if p.get("note") else ""
+            text += f"\n{mark} #{p['id']}  <code>{p['proxy_str']}</code>{note}"
+        if len(proxies) > 20:
+            text += f"\n…ещё {len(proxies) - 20}"
 
     rows = []
     for p in proxies[:20]:
         mark = ("✅" if p.get("status") == "alive"
                 else "❌" if p.get("status") == "dead" else "❓")
         rows.append([(f"{mark} #{p['id']}", f"px_view:{p['id']}")])
-    rows.append([("➕ Добавить", "px_add"),
+    rows.append([("➕ Добавить прокси", "px_add"),
                  ("🔍 Проверить все", "px_checkall")])
     rows.append([("📡 Назначить на аккаунты", "px_reassign")])
-    rows.append([("🌐 Глобальные", "gpx_list")])
+    rows.append([("🌐 Глобальные прокси", "gpx_list")])
     rows.append([home_btn()])
     try:
         await cb.message.edit_text(text, reply_markup=kb(*rows))
@@ -1824,7 +1874,7 @@ async def cb_px_add(cb: CallbackQuery):
 async def cb_px_checkall(cb: CallbackQuery):
     uid = cb.from_user.id
     proxies = await db.db_proxy_get_by_owner(uid)
-    await cb.answer(f"Проверяю {len(proxies)}…")
+    await cb.answer(f"⏳ Проверяю {len(proxies)} прокси…")
     alive = 0
     for p in proxies:
         ok = await check_proxy_connection(p["proxy_str"])
@@ -1832,8 +1882,11 @@ async def cb_px_checkall(cb: CallbackQuery):
         if ok:
             alive += 1
     await cb.message.answer(
-        f"🔍 Проверено: {len(proxies)}\n✅ Живых: {alive}\n❌ Мёртвых: "
-        f"{len(proxies) - alive}"
+        f"🔍 <b>Проверка завершена</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Проверено: <b>{len(proxies)}</b>\n"
+        f"✅ Живых: <b>{alive}</b>\n"
+        f"❌ Мёртвых: <b>{len(proxies) - alive}</b>"
     )
 
 
@@ -1843,8 +1896,10 @@ async def cb_px_reassign(cb: CallbackQuery):
     res = await reassign_phones(uid)
     await cb.answer()
     await cb.message.answer(
-        f"📡 Прокси назначены: обновлено <b>{res['updated']}</b>, "
-        f"без прокси осталось <b>{res['skipped']}</b>."
+        f"📡 <b>Назначение прокси завершено</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Обновлено аккаунтов: <b>{res['updated']}</b>\n"
+        f"⚠️ Без прокси осталось: <b>{res['skipped']}</b>"
     )
 
 
@@ -1857,17 +1912,18 @@ async def cb_px_view(cb: CallbackQuery):
     mark = ("✅" if p["status"] == "alive"
             else "❌" if p["status"] == "dead" else "❓")
     text = (
-        f"🔑 Прокси #{pid}\n"
-        f"<code>{p['proxy_str']}</code>\n"
-        f"Статус: {mark} {p['status']}\n"
-        f"Заметка: {p.get('note') or '—'}"
+        f"🔑 <b>Прокси #{pid}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📡  Адрес:    <code>{p['proxy_str']}</code>\n"
+        f"📊  Статус:   {mark} {p['status']}\n"
+        f"📝  Заметка:  {p.get('note') or '—'}"
     )
     await cb.message.edit_text(
         text,
         reply_markup=kb(
-            [("🔍 Проверить", f"px_check:{pid}")],
-            [("✏️ Заметка", f"px_note:{pid}")],
-            [("🗑 Удалить", f"px_del:{pid}")],
+            [("🔍 Проверить", f"px_check:{pid}"),
+             ("✏️ Заметка", f"px_note:{pid}")],
+            [("🗑 Удалить прокси", f"px_del:{pid}")],
             [("‹ Назад", "px_list")],
         ),
     )
@@ -1927,17 +1983,27 @@ async def cb_gpx_list(cb: CallbackQuery):
     uid = cb.from_user.id
     is_admin = await db.db_admins_check(uid)
     globs = await db.db_gproxy_get_all()
+    alive = sum(1 for g in globs if g.get("status") == "alive")
+    dead  = sum(1 for g in globs if g.get("status") == "dead")
     if not globs:
-        text = "🌐 <b>Глобальные прокси</b>\n— пусто —"
+        text = (
+            "🌐 <b>Глобальные прокси</b>\n"
+            "━━━━━━━━━━━━━━━━━━━\n"
+            "Глобальные прокси не добавлены."
+        )
     else:
-        lines = ["🌐 <b>Глобальные прокси</b>:"]
-        for g in globs:
-            lines.append(_gpx_render_row(g, is_admin))
+        text = (
+            f"🌐 <b>Глобальные прокси</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"Всего: <b>{len(globs)}</b>  ·  "
+            f"✅ {alive}  ·  ❌ {dead}\n"
+        )
+        for g in globs[:20]:
+            text += "\n" + _gpx_render_row(g, is_admin)
+        if len(globs) > 20:
+            text += f"\n…ещё {len(globs) - 20}"
         if not is_admin:
-            lines.append(
-                "\n<i>(read-only — управление доступно только админам)</i>"
-            )
-        text = "\n".join(lines)
+            text += "\n\n<i>🔒 Только для чтения — управление у админов</i>"
 
     rows = []
     for g in globs[:20]:
@@ -2003,7 +2069,7 @@ async def cb_gpx_checkall(cb: CallbackQuery):
     if not await db.db_admins_check(uid):
         return await cb.answer("⛔ Только админ.", show_alert=True)
     globs = await db.db_gproxy_get_all()
-    await cb.answer(f"Проверяю {len(globs)}…")
+    await cb.answer(f"⏳ Проверяю {len(globs)} прокси…")
     alive = 0
     for g in globs:
         ok = await check_proxy_connection(g["proxy_str"])
@@ -2011,9 +2077,11 @@ async def cb_gpx_checkall(cb: CallbackQuery):
         if ok:
             alive += 1
     await cb.message.answer(
-        f"🔍 Проверено: {len(globs)}\n"
-        f"✅ Живых: {alive}\n"
-        f"❌ Мёртвых: {len(globs) - alive}"
+        f"🔍 <b>Проверка завершена</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Проверено: <b>{len(globs)}</b>\n"
+        f"✅ Живых: <b>{alive}</b>\n"
+        f"❌ Мёртвых: <b>{len(globs) - alive}</b>"
     )
 
 
@@ -2029,16 +2097,17 @@ async def cb_gpx_view(cb: CallbackQuery):
             else "❌" if g["status"] == "dead" else "❓")
     body = (g['proxy_str'] if is_admin else mask_proxy(g['proxy_str']))
     text = (
-        f"🌐 Глобал #{pid}\n"
-        f"<code>{body}</code>\n"
-        f"Статус: {mark} {g['status']}\n"
-        f"Заметка: {g.get('note') or '—'}"
+        f"🌐 <b>Глобал #{pid}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📡  Адрес:    <code>{body}</code>\n"
+        f"📊  Статус:   {mark} {g['status']}\n"
+        f"📝  Заметка:  {g.get('note') or '—'}"
     )
     rows: List[List[Tuple[str, str]]] = []
     if is_admin:
-        rows.append([("🔍 Проверить", f"gpx_check:{pid}")])
-        rows.append([("✏️ Заметка", f"gpx_note:{pid}")])
-        rows.append([("🗑 Удалить", f"gpx_del:{pid}")])
+        rows.append([("🔍 Проверить", f"gpx_check:{pid}"),
+                     ("✏️ Заметка", f"gpx_note:{pid}")])
+        rows.append([("🗑 Удалить прокси", f"gpx_del:{pid}")])
     rows.append([("‹ Назад", "gpx_list")])
     try:
         await cb.message.edit_text(text, reply_markup=kb(*rows))
@@ -2102,11 +2171,12 @@ async def _send_target_picker(chat_id: int, prefix: str, title: str):
     <prefix>:man.
     """
     await bot.send_message(
-        chat_id, title,
+        chat_id,
+        title + "\n\n🎯 <b>Выберите цели:</b>",
         reply_markup=kb(
-            [("Все", f"{prefix}:all"),
-             ("Группа", f"{prefix}:grp"),
-             ("Вручную", f"{prefix}:man")],
+            [("📋 Все аккаунты", f"{prefix}:all")],
+            [("📁 По группе", f"{prefix}:grp"),
+             ("✏️ Вручную", f"{prefix}:man")],
             [home_btn()],
         ),
     )
@@ -2173,8 +2243,12 @@ async def cb_auto_mass(cb: CallbackQuery):
                                show_alert=True)
     store.mass_data[uid] = {}
     await cb.answer()
-    await _send_target_picker(cb.message.chat.id, "mass_t",
-                              "🚀 <b>Массовый залив</b>\nВыберите цели:")
+    await _send_target_picker(
+        cb.message.chat.id, "mass_t",
+        "🚀 <b>Массовый залив</b>\n\n"
+        "Массово обновит имя, био и фото профиля "
+        "для выбранных аккаунтов."
+    )
 
 
 @dp.callback_query(F.data.startswith("mass_t:"))
@@ -2330,8 +2404,12 @@ async def cb_auto_ldv(cb: CallbackQuery):
         return await cb.answer("⏳ Занято.", show_alert=True)
     store.ldv_data[uid] = {}
     await cb.answer()
-    await _send_target_picker(cb.message.chat.id, "ldvr_t",
-                              "🤖 <b>Рега ЛДВ</b>\nВыберите цели:")
+    await _send_target_picker(
+        cb.message.chat.id, "ldvr_t",
+        "🤖 <b>Регистрация LDV</b>\n\n"
+        "Зарегистрирует аккаунты в @leomatchbot "
+        "и запланирует автолайкинг."
+    )
 
 
 @dp.callback_query(F.data.startswith("ldvr_t:"))
@@ -2525,8 +2603,12 @@ async def cb_auto_xo(cb: CallbackQuery):
         return await cb.answer("⏳ Занято.", show_alert=True)
     store.xo_data[uid] = {}
     await cb.answer()
-    await _send_target_picker(cb.message.chat.id, "xor_t",
-                              "💘 <b>Рега XO</b>\nВыберите цели:")
+    await _send_target_picker(
+        cb.message.chat.id, "xor_t",
+        "💘 <b>Регистрация XO</b>\n\n"
+        "Зарегистрирует аккаунты в XO-боте "
+        "и запустит автолайкинг."
+    )
 
 
 @dp.callback_query(F.data.startswith("xor_t:"))
@@ -2693,9 +2775,11 @@ async def cb_auto_subdv(cb: CallbackQuery):
     if store.is_busy(uid):
         return await cb.answer("⏳ Занято.", show_alert=True)
     await cb.answer()
-    await _send_target_picker(cb.message.chat.id, "subdv_t",
-                              "📺 <b>Подписка на @leoday</b>\n"
-                              "Выберите цели:")
+    await _send_target_picker(
+        cb.message.chat.id, "subdv_t",
+        "📺 <b>Подписка на @leoday</b>\n\n"
+        "Подпишет выбранные аккаунты на канал @leoday."
+    )
 
 
 @dp.callback_query(F.data.startswith("subdv_t:"))
@@ -2761,24 +2845,32 @@ async def cb_subdv_t(cb: CallbackQuery):
 async def cb_auto_ar(cb: CallbackQuery):
     uid = cb.from_user.id
     accs = await db.db_get_accounts_by_owner(uid)
+    n_on = 0
+    n_run = 0
     rows = []
     for a in accs[:30]:
         ph = a["phone"]
         on = await db.db_ar_is_enabled(uid, ph)
         running = ar_manager.is_running(ph)
+        if on: n_on += 1
+        if running: n_run += 1
         mark = "✅" if (on and running) else ("🟡" if on else "❌")
         rows.append([(f"{mark} {ph}", f"ar_view:{ph}")])
     rows.append([("✅ Включить все", "ar_enable_all"),
                  ("❌ Выключить все", "ar_disable_all")])
     rows.append([("📁 По группе", "ar_by_group"),
-                 ("✏️ Изменить текст всем", "ar_text_all")])
+                 ("✏️ Текст всем", "ar_text_all")])
     rows.append([home_btn()])
-    await cb.message.edit_text(
+    text = (
         "💬 <b>Автоответы</b>\n"
-        "✅ — включён и работает | 🟡 — включён, но клиент не запущен | "
-        "❌ — выключен",
-        reply_markup=kb(*rows),
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"Аккаунтов: <b>{len(accs)}</b>  ·  "
+        f"Вкл: <b>{n_on}</b>  ·  Работает: <b>{n_run}</b>\n\n"
+        "✅ включён и работает\n"
+        "🟡 включён, клиент не запущен\n"
+        "❌ выключен"
     )
+    await cb.message.edit_text(text, reply_markup=kb(*rows))
     await cb.answer()
 
 
@@ -2788,19 +2880,29 @@ async def cb_ar_view(cb: CallbackQuery):
     uid = cb.from_user.id
     s = await db.db_ar_get_settings(uid, phone)
     on = bool(s.get("enabled"))
+    running = ar_manager.is_running(phone)
     custom = s.get("custom_text") or "—"
     silenced = ar_manager.silenced_count(phone)
+    if on and running:
+        status_str = "✅ Включён и работает"
+    elif on:
+        status_str = "🟡 Включён (клиент не запущен)"
+    else:
+        status_str = "❌ Выключен"
     text = (
-        f"💬 <code>{phone}</code>\n"
-        f"Статус: {'✅ Вкл' if on else '❌ Выкл'}\n"
-        f"Свой текст: <i>{(custom[:120] if custom else '—')}</i>\n"
-        f"Замолчанных чатов: <b>{silenced}</b>"
+        f"💬 <b>Автоответ</b>  <code>{phone}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📊  Статус:          {status_str}\n"
+        f"🔇  Замолчано чатов: <b>{silenced}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"✏️  Текст ответа:\n"
+        f"<i>{(custom[:200] if custom else '— (используется стандартный) —')}</i>"
     )
+    toggle_text = "❌ Выключить" if on else "✅ Включить"
     rows = [
-        [(("❌ Выключить" if on else "✅ Включить"),
-          f"ar_toggle:{phone}")],
-        [("✏️ Свой текст", f"ar_text:{phone}")],
-        [("🔇 Сброс замолчанных", f"ar_reset:{phone}")],
+        [(toggle_text, f"ar_toggle:{phone}"),
+         ("✏️ Текст", f"ar_text:{phone}")],
+        [("🔇 Сбросить молчание", f"ar_reset:{phone}")],
         [("‹ Назад", "auto_ar")],
     ]
     try:
@@ -2902,11 +3004,14 @@ async def cb_ar_by_group(cb: CallbackQuery):
     _grp_index_cache[uid] = groups
     rows = []
     for i, g in enumerate(groups[:20]):
-        rows.append([(f"📁 {g} (вкл)", f"ar_grp:on:{i}"),
-                     (f"📁 {g} (выкл)", f"ar_grp:off:{i}")])
+        rows.append([(f"✅ {g}", f"ar_grp:on:{i}"),
+                     (f"❌ {g}", f"ar_grp:off:{i}")])
     rows.append([("‹ Назад", "auto_ar")])
-    await cb.message.edit_text("📁 Автоответ по группе:",
-                               reply_markup=kb(*rows))
+    await cb.message.edit_text(
+        "📁 <b>Автоответ по группе</b>\n\n"
+        "✅ — включить группу  |  ❌ — выключить группу",
+        reply_markup=kb(*rows),
+    )
     await cb.answer()
 
 
@@ -3038,12 +3143,14 @@ async def cb_mng_manual_xo(cb: CallbackQuery):
 @dp.callback_query(F.data == "mng_ldv")
 async def cb_mng_ldv(cb: CallbackQuery):
     await cb.message.edit_text(
-        "⚙️ <b>Управление лайкингом ДВ</b>",
+        "🤖 <b>Управление лайкингом LDV</b>\n\n"
+        "Просматривайте активные циклы, ставьте на паузу "
+        "или удаляйте задачи.",
         reply_markup=kb(
             [("📋 Активные циклы", "mng_ldv_list:0")],
-            [("🔄 Сбросить все", "mng_ldv_resetall")],
-            [("📁 Сбросить в группе", "mng_ldv_resetgrp")],
-            [("🎯 Сбросить выборочно", "mng_ldv_resetman")],
+            [("🗑 Сбросить все", "mng_ldv_resetall")],
+            [("📁 Сбросить по группе", "mng_ldv_resetgrp"),
+             ("🎯 Сбросить выборочно", "mng_ldv_resetman")],
             [("‹ Назад", "back_manage"), home_btn()],
         ),
     )
@@ -3054,12 +3161,14 @@ async def cb_mng_ldv(cb: CallbackQuery):
 async def cb_back_manage(cb: CallbackQuery):
     # перерисуем меню «Управление»
     await cb.message.edit_text(
-        "📊 <b>Управление</b>",
+        "📊 <b>Управление</b>\n\n"
+        "Ручной запуск лайкинга, управление задачами "
+        "и отмена регистраций.",
         reply_markup=kb(
-            [("❤️ Ручной пролайк ДВ", "mng_manual_ldv")],
-            [("💘 Ручной пролайк XO", "mng_manual_xo")],
-            [("⚙️ Управление лайкингом ДВ", "mng_ldv")],
-            [("💘 Управление XO", "mng_xo_panel")],
+            [("❤️ Пролайк LDV", "mng_manual_ldv"),
+             ("💘 Пролайк XO", "mng_manual_xo")],
+            [("⚙️ Задачи LDV", "mng_ldv"),
+             ("💘 Задачи XO", "mng_xo_panel")],
             [("🛑 Отмена регистрации", "mng_regcancel")],
             [home_btn()],
         ),
@@ -3091,25 +3200,32 @@ async def cb_mng_ldv_list(cb: CallbackQuery):
 
     if not tasks:
         await cb.message.edit_text(
-            "📋 LDV-циклов нет.",
+            "📋 <b>LDV-циклы</b>\n"
+            "━━━━━━━━━━━━━━━━━━━\n"
+            "Активных циклов нет.",
             reply_markup=kb([("‹ Назад", "mng_ldv")]),
         )
         return await cb.answer()
 
-    lines = ["📋 <b>Активные LDV-циклы</b>:"]
+    n_run  = sum(1 for t in tasks if t["phone"] in store.current_liking_phones)
+    n_paus = sum(1 for t in tasks if t["phone"] in store.paused_phones)
+    lines = [
+        f"📋 <b>LDV-циклы</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Задач: <b>{total}</b>  ·  "
+        f"▶️ активных: {n_run}  ·  ⏸ пауза: {n_paus}\n"
+    ]
     rows = []
     for t in chunk:
         ph = t["phone"]
         st = t["status"]
         nxt = time.strftime("%d.%m %H:%M",
                             time.localtime(t["next_run"] or 0))
-        paused = "⏸" if ph in store.paused_phones else ""
-        running = "▶️" if ph in store.current_liking_phones else ""
-        lines.append(
-            f"{paused}{running} {ph} — {st} / next: {nxt} / step={t['step']}"
-        )
-        # три кнопки в ряд: пауза / возобновить / удалить
         is_paused = ph in store.paused_phones
+        running_icon = "▶️" if ph in store.current_liking_phones else ("⏸" if is_paused else "⏳")
+        lines.append(
+            f"{running_icon} {ph} — {st}  /  next: {nxt}  /  шаг {t['step']}"
+        )
         rows.append([
             ((("▶️ Resume" if is_paused else "⏸ Pause"),
               f"mng_ldv_pp:{ph}")),
@@ -3157,13 +3273,15 @@ async def cb_mng_ldv_resetall(cb: CallbackQuery):
     await cb.answer()
     confirm = await ask_with_retry(
         bot, cb.message.chat.id, uid,
-        "⚠️ Удалить ВСЕ LDV-задачи? Напишите <b>ДА</b>.",
+        "⚠️ <b>Удалить ВСЕ LDV-задачи?</b>\n\n"
+        "Все циклы лайкинга будут остановлены и удалены из базы.\n"
+        "Для подтверждения напишите <b>ДА</b>:",
         validator=lambda t: t.strip().lower() == "да",
-        error_msg='❌ Напишите именно "ДА".',
+        error_msg='❌ Напишите именно "ДА" для подтверждения.',
         parse_mode="HTML",
     )
     if not confirm:
-        return await cb.message.answer("Отменено.")
+        return await cb.message.answer("✅ Отменено.")
     tasks = await db.db_get_ldv_tasks_by_owner(uid)
     for t in tasks:
         store.cancelled_phones.add(t["phone"])
@@ -3239,18 +3357,30 @@ async def cmd_xo_manage(msg: Message):
 async def _xo_manage_render(chat_id: int, uid: int, edit_msg=None):
     tasks = await db.db_get_xo_tasks_by_owner(uid)
     if not tasks:
-        text = "💘 XO-задач нет."
+        text = (
+            "💘 <b>Управление XO</b>\n"
+            "━━━━━━━━━━━━━━━━━━━\n"
+            "Активных задач нет."
+        )
         rows = [[("‹ Назад", "back_manage"), home_btn()]]
     else:
-        text_lines = ["💘 <b>Активные XO-задачи</b>:"]
+        n_run   = sum(1 for t in tasks if t["status"] == "running")
+        n_paus  = sum(1 for t in tasks if t["status"] == "paused")
+        text_lines = [
+            f"💘 <b>Управление XO</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"Задач: <b>{len(tasks)}</b>  ·  "
+            f"▶️ активных: {n_run}  ·  ⏸ пауза: {n_paus}\n"
+        ]
         rows = []
         for t in tasks[:30]:
             ph = t["phone"]
             st = t["status"]
             nxt = time.strftime("%d.%m %H:%M",
                                 time.localtime(t["next_run"] or 0))
-            text_lines.append(f"• {ph} — {st} / next: {nxt}")
             is_paused = ph in store.xo_liking_paused
+            paused_icon = "⏸" if is_paused else "▶️"
+            text_lines.append(f"{paused_icon} {ph} — {st}  /  next: {nxt}")
             rows.append([
                 ((("▶️ Resume" if is_paused else "⏸ Pause"),
                   f"mng_xo_pp:{ph}")),
@@ -3320,23 +3450,23 @@ async def cb_mng_regcancel(cb: CallbackQuery):
     uid = cb.from_user.id
     pending_ldv = len(store.ldv_reg_cancel)
     pending_xo = len(store.xo_reg_cancel)
-    # покажем сколько сейчас в активных партиях
     active_ldv_targets = (store.ldv_data.get(uid) or {}).get("targets") or []
     active_xo_targets = (store.xo_data.get(uid) or {}).get("targets") or []
     text = (
-        "🛑 <b>Отмена регистрации</b>\n\n"
-        f"Активная партия ЛДВ: <b>{len(active_ldv_targets)}</b> номеров\n"
-        f"Активная партия XO:  <b>{len(active_xo_targets)}</b> номеров\n\n"
-        f"Уже в очереди на отмену:\n"
-        f"  • ЛДВ: <b>{pending_ldv}</b>\n"
-        f"  • XO:  <b>{pending_xo}</b>"
+        "🛑 <b>Отмена регистрации</b>\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"🤖  LDV — активная партия:  <b>{len(active_ldv_targets)}</b>\n"
+        f"💘  XO  — активная партия:  <b>{len(active_xo_targets)}</b>\n\n"
+        f"В очереди на отмену:\n"
+        f"    ▸ LDV: <b>{pending_ldv}</b>\n"
+        f"    ▸ XO:  <b>{pending_xo}</b>"
     )
     await cb.message.edit_text(
         text,
         reply_markup=kb(
-            [("🤖 Отменить ЛДВ", "rc_ldv")],
-            [("💘 Отменить XO", "rc_xo")],
-            [("♻️ Очистить очередь отмены", "rc_clear")],
+            [("🤖 Отменить LDV", "rc_ldv"),
+             ("💘 Отменить XO", "rc_xo")],
+            [("♻️ Очистить стоп-лист", "rc_clear")],
             [("‹ Назад", "back_manage"), home_btn()],
         ),
     )
@@ -3357,12 +3487,12 @@ async def cb_rc_clear(cb: CallbackQuery):
 @dp.callback_query(F.data == "rc_ldv")
 async def cb_rc_ldv(cb: CallbackQuery):
     await cb.message.edit_text(
-        "🛑 <b>Отмена регистрации ЛДВ</b>\n"
-        "Выберите способ:",
+        "🛑 <b>Отмена регистрации LDV</b>\n\n"
+        "Выберите диапазон аккаунтов для отмены:",
         reply_markup=kb(
-            [("Все", "rc_ldv_all")],
-            [("Группа", "rc_ldv_grp")],
-            [("По номерам", "rc_ldv_man")],
+            [("📋 Все аккаунты", "rc_ldv_all")],
+            [("📁 По группе", "rc_ldv_grp"),
+             ("✏️ По номерам", "rc_ldv_man")],
             [("‹ Назад", "mng_regcancel"), home_btn()],
         ),
     )
@@ -3442,12 +3572,12 @@ async def cb_rc_ldv_man(cb: CallbackQuery):
 @dp.callback_query(F.data == "rc_xo")
 async def cb_rc_xo(cb: CallbackQuery):
     await cb.message.edit_text(
-        "🛑 <b>Отмена регистрации XO</b>\n"
-        "Выберите способ:",
+        "🛑 <b>Отмена регистрации XO</b>\n\n"
+        "Выберите диапазон аккаунтов для отмены:",
         reply_markup=kb(
-            [("Все", "rc_xo_all")],
-            [("Группа", "rc_xo_grp")],
-            [("По номерам", "rc_xo_man")],
+            [("📋 Все аккаунты", "rc_xo_all")],
+            [("📁 По группе", "rc_xo_grp"),
+             ("✏️ По номерам", "rc_xo_man")],
             [("‹ Назад", "mng_regcancel"), home_btn()],
         ),
     )
@@ -3530,14 +3660,19 @@ async def cb_adm_wl(cb: CallbackQuery):
     if not await db.db_admins_check(cb.from_user.id):
         return await cb.answer("⛔", show_alert=True)
     rows_db = await db.db_whitelist_get_all()
-    text_lines = ["👥 <b>Whitelist</b>:"]
-    for r in rows_db[:30]:
-        text_lines.append(
-            f"• <code>{r['user_id']}</code>"
-            + (f" (@{r['username']})" if r.get('username') else "")
-        )
-    if not rows_db:
-        text_lines.append("— пусто —")
+    text_lines = [
+        f"👥 <b>Whitelist</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Пользователей: <b>{len(rows_db)}</b>\n"
+    ]
+    if rows_db:
+        for r in rows_db[:30]:
+            uname = f" — @{r['username']}" if r.get("username") else ""
+            text_lines.append(f"• <code>{r['user_id']}</code>{uname}")
+        if len(rows_db) > 30:
+            text_lines.append(f"…ещё {len(rows_db) - 30}")
+    else:
+        text_lines.append("— список пуст —")
     await cb.message.edit_text(
         "\n".join(text_lines),
         reply_markup=kb(
@@ -3554,12 +3689,14 @@ async def cb_adm_back(cb: CallbackQuery):
     if not await db.db_admins_check(cb.from_user.id):
         return await cb.answer("⛔", show_alert=True)
     await cb.message.edit_text(
-        "👑 <b>Админ-панель</b>",
+        "👑 <b>Администрирование</b>\n\n"
+        "Управление доступом пользователей, "
+        "глобальными прокси и просмотр всех аккаунтов.",
         reply_markup=kb(
-            [("👥 Whitelist", "adm_wl")],
-            [("👮 Админы", "adm_admins")],
-            [("🌐 Глобальные прокси", "gpx_list")],
-            [("📋 Все аккаунты", "adm_all_accs")],
+            [("👥 Whitelist", "adm_wl"),
+             ("👮 Администраторы", "adm_admins")],
+            [("🌐 Глобальные прокси", "gpx_list"),
+             ("📋 Все аккаунты", "adm_all_accs")],
             [home_btn()],
         ),
     )
@@ -3626,9 +3763,16 @@ async def cb_adm_admins(cb: CallbackQuery):
     if not await db.db_admins_check(cb.from_user.id):
         return await cb.answer("⛔", show_alert=True)
     rows_db = await db.db_admins_get_all()
-    text_lines = ["👮 <b>Админы</b>:"]
-    for r in rows_db:
-        text_lines.append(f"• <code>{r['user_id']}</code>")
+    text_lines = [
+        f"👮 <b>Администраторы</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Всего: <b>{len(rows_db)}</b>\n"
+    ]
+    if rows_db:
+        for r in rows_db:
+            text_lines.append(f"• <code>{r['user_id']}</code>")
+    else:
+        text_lines.append("— список пуст —")
     await cb.message.edit_text(
         "\n".join(text_lines),
         reply_markup=kb(
@@ -3682,26 +3826,33 @@ async def cb_adm_all_accs(cb: CallbackQuery):
         return await cb.answer("⛔", show_alert=True)
     rows_db = await db.db_get_all_accounts()
     if not rows_db:
-        text = "📋 Аккаунтов нет."
+        text = (
+            "📋 <b>Все аккаунты</b>\n"
+            "━━━━━━━━━━━━━━━━━━━\n"
+            "Аккаунтов нет."
+        )
     else:
-        lines = [f"📋 <b>Все аккаунты</b>: {len(rows_db)}"]
-        # сгруппируем по owner_id
         by_owner: Dict[int, List[Dict[str, Any]]] = {}
         for a in rows_db:
             by_owner.setdefault(a.get("owner_id") or 0, []).append(a)
+        lines = [
+            f"📋 <b>Все аккаунты</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"Всего: <b>{len(rows_db)}</b>  ·  "
+            f"Пользователей: <b>{len(by_owner)}</b>"
+        ]
         for owner_id, accs in by_owner.items():
-            lines.append(f"\n👤 <code>{owner_id}</code> — {len(accs)}:")
-            for a in accs[:20]:
+            lines.append(f"\n👤 <code>{owner_id}</code> — {len(accs)} аккаунтов:")
+            for a in accs[:15]:
+                grp = f" 📁{a['grp']}" if a.get("grp") else ""
                 lines.append(
-                    f"  • {a['phone']} (@{a.get('username') or '-'})"
-                    + (f" / {a.get('grp')}" if a.get('grp') else "")
+                    f"  • {a['phone']} (@{a.get('username') or '—'}){grp}"
                 )
-            if len(accs) > 20:
-                lines.append(f"  …и ещё {len(accs) - 20}")
+            if len(accs) > 15:
+                lines.append(f"  …ещё {len(accs) - 15}")
         text = "\n".join(lines)
-    # Telegram ограничение — режем
-    if len(text) > 3500:
-        text = text[:3500] + "\n…(обрезано)…"
+    if len(text) > 3800:
+        text = text[:3800] + "\n…(обрезано)…"
     await cb.message.edit_text(
         text,
         reply_markup=kb([("‹ Назад", "adm_back"), home_btn()]),
