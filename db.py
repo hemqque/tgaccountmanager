@@ -379,6 +379,7 @@ async def db_whitelist_get_all() -> List[Dict[str, Any]]:
 
 async def db_whitelist_check(user_id: int) -> bool:
     async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("PRAGMA busy_timeout=5000")
         cur = await db.execute(
             "SELECT 1 FROM whitelist WHERE user_id=?", (user_id,)
         )
@@ -410,6 +411,7 @@ async def db_admins_get_all() -> List[Dict[str, Any]]:
 
 async def db_admins_check(user_id: int) -> bool:
     async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("PRAGMA busy_timeout=5000")
         cur = await db.execute(
             "SELECT 1 FROM admins WHERE user_id=?", (user_id,)
         )

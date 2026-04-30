@@ -164,24 +164,18 @@ async def _finish_progress(bot: Bot, uid: int, store,
         text += "\n\n⚠️ Ошибки:\n" + "\n".join(
             f"  • {e}" for e in state["errors"][-10:]
         )
-    await _safe_edit(bot, state["chat_id"], state["message_id"], text)
-
-    # отложенно: открепить и удалить
     chat_id = state["chat_id"]
     msg_id = state["message_id"]
     pinned = state.get("pinned")
-
-    async def _cleanup():
-        await asyncio.sleep(60)
-        try:
-            if pinned:
-                await bot.unpin_chat_message(chat_id, msg_id)
-        except Exception:
-            pass
-        try:
-            await bot.delete_message(chat_id, msg_id)
-        except Exception:
-            pass
-
-    asyncio.create_task(_cleanup())
     store.progress_msg.pop(uid, None)
+
+    # Открепить и удалить сразу
+    try:
+        if pinned:
+            await bot.unpin_chat_message(chat_id, msg_id)
+    except Exception:
+        pass
+    try:
+        await bot.delete_message(chat_id, msg_id)
+    except Exception:
+        pass

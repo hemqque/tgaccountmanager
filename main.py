@@ -171,10 +171,19 @@ async def access_middleware(handler, event, data):
     """
     Любой апдейт от неизвестного user_id → отказ.
     Только admins и whitelist допускаются.
+
+    Служебные сообщения от ботов (уведомления о закреплении сообщений и т. п.)
+    пропускаются без проверки доступа — у бота нет записи в таблице admins/whitelist,
+    и без этой проверки middleware отправляло бы «⛔ нет доступа» в приватный чат.
     """
     uid = None
     msg_or_cb = None
     if event.message:
+        # Пропускаем служебные обновления от ботов (в т. ч. от нас самих):
+        # pin_chat_message порождает service-message с from_user = бот,
+        # который не состоит в whitelist/admins.
+        if event.message.from_user and event.message.from_user.is_bot:
+            return await handler(event, data)
         uid = event.message.from_user.id if event.message.from_user else None
         msg_or_cb = event.message
     elif event.callback_query:
@@ -184,7 +193,14 @@ async def access_middleware(handler, event, data):
         uid = event.inline_query.from_user.id
     if uid is None:
         return await handler(event, data)
-    if await is_allowed(uid):
+
+    try:
+        allowed = await is_allowed(uid)
+    except Exception as e:
+        log.error("access_middleware: is_allowed(%s) raised %s — пропускаем", uid, e)
+        return await handler(event, data)
+
+    if allowed:
         return await handler(event, data)
 
     # отказ
@@ -505,12 +521,13 @@ async def cb_acc_add(cb: CallbackQuery):
                     await _update_progress(bot, uid, store, done_inc=1,
                                            current=None,
                                            error=f"{ph}: {e}")
+            was_cancelled = bool(_batch_cancel.get(uid))
             _batch_cancel.pop(uid, None)
             try:
                 await cancel_msg.delete()
             except Exception:
                 pass
-            cancelled_note = " (отменено)" if _batch_cancel.get(uid) else ""
+            cancelled_note = " (отменено)" if was_cancelled else ""
             await _finish_progress(bot, uid, store,
                                    summary_extra=f"Добавлено: {ok_count}/"
                                                  f"{len(phones)}{cancelled_note}")
@@ -547,12 +564,32 @@ async def _add_one_account(uid: int, chat_id: int, phone: str) -> bool:
     os.makedirs(config.SESSIONS_DIR, exist_ok=True)
     session_path = os.path.join(config.SESSIONS_DIR, phone)
     tproxy = proxy_to_telethon(proxy_str)
+    # Если аккаунт уже есть в пуле — отключаем его, чтобы избежать
+    # конфликта блокировок SQLite на одном .session файле.
+    await _client_pool.remove(phone)
     client = TelegramClient(session_path, config.API_ID, config.API_HASH,
                             proxy=tproxy)
     try:
         await client.connect()
         if await client.is_user_authorized():
-            await bot.send_message(uid, f"ℹ️ {phone}: уже авторизован.")
+            existing = await db.db_get_account(phone)
+            if existing:
+                # Уже в БД — только обновляем прокси, группу не трогаем
+                if proxy_str and existing.get("proxy") != proxy_str:
+                    await db.db_update_account_field(phone, "proxy", proxy_str)
+                await bot.send_message(
+                    uid,
+                    f"ℹ️ <code>{phone}</code> уже есть в базе — пропускаю.",
+                    parse_mode="HTML",
+                )
+                await client.disconnect()
+                return True
+            # Авторизован, но не в БД — добавляем (setup + выбор группы)
+            await bot.send_message(
+                uid,
+                f"ℹ️ <code>{phone}</code>: уже авторизован, добавляю в базу…",
+                parse_mode="HTML",
+            )
         else:
             sent = await client.send_code_request(phone)
             signed_in = False
@@ -1332,16 +1369,18 @@ async def cb_acc_reset_all(cb: CallbackQuery):
     )
     if not confirm:
         return await cb.message.answer("Отменено.")
+    import glob as _glob
     accs = await db.db_get_accounts_by_owner(uid)
     n = 0
     for a in accs:
         try:
             await db.db_delete_account(a["phone"])
-            sp = os.path.join(config.SESSIONS_DIR, a["phone"] + ".session")
-            try:
-                os.remove(sp)
-            except Exception:
-                pass
+            base = os.path.join(config.SESSIONS_DIR, a["phone"])
+            for _sp in _glob.glob(base + "*.session*"):
+                try:
+                    os.remove(_sp)
+                except Exception:
+                    pass
             n += 1
         except Exception:
             pass
@@ -1703,12 +1742,14 @@ async def cb_acc_del2(cb: CallbackQuery):
     await _client_pool.remove(phone)
     # удалить из БД
     await db.db_delete_account(phone)
-    # стереть .session
-    sp = os.path.join(config.SESSIONS_DIR, phone + ".session")
-    try:
-        os.remove(sp)
-    except Exception:
-        pass
+    # стереть .session и .session-journal
+    import glob as _glob
+    base = os.path.join(config.SESSIONS_DIR, phone)
+    for _sp in _glob.glob(base + "*.session*"):
+        try:
+            os.remove(_sp)
+        except Exception:
+            pass
     await cb.answer("Удалён.")
     await cb.message.edit_text(f"🗑 <code>{phone}</code> удалён.")
 
@@ -2074,7 +2115,7 @@ async def _send_target_picker(chat_id: int, prefix: str, title: str):
 async def _send_groups_picker(uid: int, chat_id: int, prefix: str):
     groups = await db.db_get_groups_by_owner(uid)
     if not groups:
-        await bot.send_message(uid, "📁 У вас нет групп.")
+        await bot.send_message(chat_id, "📁 У вас нет групп.")
         return
     _grp_index_cache[uid] = groups
     rows = []
@@ -2578,6 +2619,7 @@ async def cb_xor_photodone(cb: CallbackQuery):
 
         for i, ph in enumerate(targets):
             if ph in store.xo_reg_cancel:
+                store.xo_reg_cancel.discard(ph)
                 await _update_progress(bot, uid, store, done_inc=1,
                                        error=f"{ph}: отменено")
                 continue
@@ -3118,6 +3160,7 @@ async def cb_mng_ldv_resetall(cb: CallbackQuery):
         "⚠️ Удалить ВСЕ LDV-задачи? Напишите <b>ДА</b>.",
         validator=lambda t: t.strip().lower() == "да",
         error_msg='❌ Напишите именно "ДА".',
+        parse_mode="HTML",
     )
     if not confirm:
         return await cb.message.answer("Отменено.")
@@ -3720,8 +3763,7 @@ async def _on_startup():
     set_admin_notifier(_notify_admins)
     # фоновые таски
     asyncio.create_task(run_health_check_loop())
-    asyncio.create_task(ldv_scheduler(store, task_queue=task_queue,
-                                      notify_func=notify_owner))
+    asyncio.create_task(ldv_scheduler(store, notify_func=notify_owner))
     asyncio.create_task(xo_liking_scheduler(store, notify_func=notify_owner))
     # автоответы из БД
     asyncio.create_task(_bootstrap_autoreplies())

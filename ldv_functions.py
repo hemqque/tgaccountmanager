@@ -88,7 +88,9 @@ async def register_one_ldv(client: TelegramClient,
 
     try:
         if _is_cancel(): return False
-        await _send("/start");                     await _save(0)
+        await client.send_message(bot, "/start")
+        await asyncio.sleep(2)
+        await _save(0)
 
         # ── Проверка: аккаунт уже зарегистрирован? ──────────────
         try:
@@ -380,14 +382,16 @@ async def ldv_liking_task(phone: str, owner_id: int, store,
 # =================================================================
 # ldv_scheduler — фоновый планировщик
 # =================================================================
-async def ldv_scheduler(store, task_queue=None,
+async def ldv_scheduler(store,
                         notify_func: Optional[
                             Callable[[int, str], Awaitable[None]]
-                        ] = None) -> None:
+                        ] = None,
+                        task_queue=None) -> None:
     """
     Каждые 10с забирает все pending ldv_tasks с next_run<=now и
-    стартует ldv_liking_task. Если phone уже в current_liking_phones —
-    пропускает.
+    стартует ldv_liking_task через asyncio.create_task (не через TaskQueue,
+    чтобы не блокировать очередь регистраций).
+    Если phone уже в current_liking_phones — пропускает.
     """
     while True:
         try:
@@ -404,14 +408,10 @@ async def ldv_scheduler(store, task_queue=None,
                 async def _runner(p=phone, o=owner_id):
                     await ldv_liking_task(p, o, store, notify_func=notify_func)
 
-                if task_queue is not None:
-                    await task_queue.submit(
-                        _runner, owner_id=owner_id,
-                        notify=notify_func,
-                        title=f"LDV-цикл {phone}",
-                    )
-                else:
-                    asyncio.create_task(_runner())
+                # LDV-лайкинг всегда запускается как отдельная задача,
+                # а не через TaskQueue — чтобы не блокировать очередь
+                # регистраций и массовых операций (Semaphore(2)).
+                asyncio.create_task(_runner())
         except Exception as e:
             log.warning("ldv_scheduler error: %s", e)
 

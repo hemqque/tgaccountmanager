@@ -1,0 +1,21 @@
+2026-04-29 04:54:57,171 [INFO] main: ћенеджер запущен.
+2026-04-29 04:54:57,172 [INFO] aiogram.dispatcher: Start polling
+2026-04-29 04:54:57,176 [INFO] main: Autoreplies started: 0
+2026-04-29 04:54:57,539 [INFO] aiogram.dispatcher: Run polling for bot @wefewfvbot id=8700734986 - 'rwegre'
+2026-04-29 04:54:57,985 [INFO] aiogram.event: Update id=428899777 is handled. Duration 375 ms by bot id=8700734986
+2026-04-29 04:54:58,050 [INFO] aiogram.event: Update id=428899775 is handled. Duration 438 ms by bot id=8700734986
+2026-04-29 04:54:58,083 [INFO] aiogram.event: Update id=428899778 is handled. Duration 469 ms by bot id=8700734986
+2026-04-29 04:54:58,109 [INFO] aiogram.event: Update id=428899776 is handled. Duration 500 ms by bot id=8700734986
+2026-04-29 04:55:08,992 [INFO] aiogram.event: Update id=428899779 is handled. Duration 186 ms by bot id=8700734986
+2026-04-29 04:55:19,388 [INFO] aiogram.event: Update id=428899780 is handled. Duration 1391 ms by bot id=8700734986
+2026-04-29 04:55:19,562 [INFO] tdata: opentele patch applied: kMaxAccounts=32, readMapWith resilient
+2026-04-29 04:55:19,566 [INFO] tdata: opentele: map read failed (TDataReadMapDataFailed: Could not read map data, find not found or couldn't be o) Ч продолжаем к readMtpData
+2026-04-29 04:55:19,567 [INFO] tdata: opentele: map read failed (TDataReadMapDataFailed: Could not read map data, find not found or couldn't be o) Ч продолжаем к readMtpData
+2026-04-29 04:55:19,568 [INFO] tdata: opentele: map read failed (TDataReadMapDataFailed: Could not read map data, find not found or couldn't be o) Ч продолжаем к readMtpData
+2026-04-29 04:55:19,569 [INFO] tdata: opentele: map read failed (TDataReadMapDataFailed: Could not read map data, find not found or couldn't be o) Ч продолжаем к readMtpData
+2026-04-29 04:55:19,570 [INFO] tdata: opentele: map read failed (TDataReadMapDataFailed: Could not read map data, find not found or couldn't be o) Ч продолжаем к readMtpData
+2026-04-29 04:55:19,570 [INFO] tdata: opentele: map read failed (TDataReadMapDataFailed: Could not read map data, find not found or couldn't be o) Ч продолжаем к readMtpData
+2026-04-29 04:55:19,571 [INFO] tdata: opentele: map read failed (TDataReadMapDataFailed: Could not read map data, find not found or couldn't be o) Ч продолжаем к readMtpData
+2026-04-29 04:55:19,572 [INFO] tdata: opentele: map read failed (TDataReadMapDataFailed: Could not read map data, find not found or couldn't be o) Ч продолжаем к readMtpData
+2026-04-29 04:55:19,572 [INFO] tdata: opentele: map read failed (TDataReadMapDataFailed: Could not read map data, find not found or couldn't be o) Ч продолжаем к readMtpData
+2026-04-29 04:55:19,574 [INFO] tdata: opentele: map read failed (TDataReadMapDataFailed: Unknown key type in encrypted map: 23 [ Called by BaseOb) Ч продолжаем к readMtpData

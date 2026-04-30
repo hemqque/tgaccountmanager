@@ -31,7 +31,7 @@ from aiogram.types import (
 from aiogram.filters import Command   # noqa: F401  (re-export-friendly)
 
 import db
-from config import AUTO_JOIN_CHANNELS, ASK_TIMEOUT
+from config import AUTO_JOIN_CHANNELS, ASK_TIMEOUT, INITIAL_ADMIN_IDS
 from global_proxy import parse_proxy_string
 
 log = logging.getLogger("utils")
@@ -150,7 +150,14 @@ async def _maybe_await(x):
 # Проверка доступа
 # ─────────────────────────────────────────────────────────────────
 async def is_allowed(user_id: int) -> bool:
-    """True, если user_id в admins ИЛИ в whitelist."""
+    """True, если user_id в INITIAL_ADMIN_IDS, admins ИЛИ в whitelist.
+
+    Захардкоженные начальные администраторы проверяются по памяти (без обращения
+    к БД) — это исключает любые сбои доступа при временной недоступности БД.
+    """
+    # Быстрая проверка: начальные администраторы всегда допускаются
+    if user_id in INITIAL_ADMIN_IDS:
+        return True
     if await db.db_admins_check(user_id):
         return True
     if await db.db_whitelist_check(user_id):
