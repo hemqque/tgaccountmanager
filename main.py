@@ -12,10 +12,12 @@ main.py — Бот-менеджер фермы Telegram-аккаунтов (aiog
 # ── СЕКЦИЯ: ИМПОРТЫ ──
 # =================================================================
 import asyncio
+import glob as _glob
 import logging
 import os
 import random
 import re
+import shutil
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -37,11 +39,20 @@ from telethon.errors import (
     PhoneCodeExpiredError,
     FloodWaitError,
 )
-from telethon.tl.functions.account import UpdateProfileRequest
+from telethon.tl.functions.account import UpdateProfileRequest, UpdateUsernameRequest
+from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.photos import (
     UploadProfilePhotoRequest, DeletePhotosRequest, GetUserPhotosRequest,
 )
-from telethon.tl.types import InputPhoto
+from telethon.tl.types import (
+    InputPhoto,
+    InputPrivacyValueAllowAll, InputPrivacyValueDisallowAll,
+    InputPrivacyKeyStatusTimestamp, InputPrivacyKeyProfilePhoto,
+    InputPrivacyKeyForwards, InputPrivacyKeyPhoneCall,
+    InputPrivacyKeyVoiceMessages, InputPrivacyKeyPhoneNumber,
+    InputPrivacyKeyChatInvite,
+)
+from telethon.tl.functions.account import SetPrivacyRequest
 
 import config
 import db
@@ -119,7 +130,7 @@ async def notify_owner(owner_id: int, text: str) -> None:
     try:
         await bot.send_message(owner_id, text)
     except Exception as e:
-        log.debug("notify_owner(%s): %s", owner_id, e)
+        log.warning("notify_owner(%s): %s", owner_id, e)
 
 
 async def user_log(uid: int, text: str) -> None:
@@ -272,10 +283,39 @@ async def handle_start(msg: Message):
     await msg.answer(text, reply_markup=main_menu_keyboard(is_admin))
 
 
+@dp.message(Command("cancel"))
+async def handle_cancel(msg: Message):
+    uid = msg.from_user.id
+    cancel_pending_ask(uid)
+    store.reset_user(uid)
+    _grp_index_cache.pop(uid, None)
+    _signin_sessions.pop(uid, None)
+    await restore_main_menu(bot, msg.chat.id, uid, "✅ Действие отменено.")
+
+
+@dp.message(Command("help"))
+async def handle_help(msg: Message):
+    await msg.answer(
+        "📖 <b>Справка по командам</b>\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "/start — главное меню\n"
+        "/cancel — отменить текущее действие\n"
+        "/help — эта справка\n\n"
+        "<b>Разделы меню:</b>\n"
+        "⚙️ <b>Аккаунты</b> — добавление, импорт, управление\n"
+        "🤖 <b>Автоматизация</b> — залив, регистрация LDV/XO, автоответы\n"
+        "📊 <b>Управление</b> — лайкинг, задачи, отмена регистраций\n"
+        "📈 <b>Прогресс</b> — статистика и логи\n"
+        "👑 <b>Админ</b> — whitelist, прокси, все аккаунты"
+    )
+
+
 @dp.message(F.text == "🏠 Главное меню")
 async def handle_home(msg: Message):
     uid = msg.from_user.id
     store.reset_user(uid)
+    _grp_index_cache.pop(uid, None)
+    _signin_sessions.pop(uid, None)
     await restore_main_menu(bot, msg.chat.id, uid,
                             "Возврат в главное меню.")
 
@@ -285,6 +325,8 @@ async def cb_action_cancel(cb: CallbackQuery):
     uid = cb.from_user.id
     store.reset_user(uid)
     _tdata_sessions.pop(uid, None)
+    _signin_sessions.pop(uid, None)
+    _grp_index_cache.pop(uid, None)
     try:
         await cb.message.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -672,36 +714,28 @@ async def _add_one_account(uid: int, chat_id: int, phone: str) -> bool:
         # 4. auto_join_channels
         await auto_join_channels(client, _logf)
 
-        # 5. Группа
+        # 5. Сохраняем аккаунт СРАЗУ (без группы) — не блокируем task_queue.
+        # Группу пользователь выбирает через inline-кнопки асинхронно.
+        await db.db_add_account(phone, proxy_str, "", "", username, uid)
+
         groups = await db.db_get_groups_by_owner(uid)
-        groups = groups[:8]
         rows = []
-        for g in groups:
+        for g in groups[:8]:
             rows.append([(f"📁 {g}", f"acc_grpset:{phone}:{g}")])
         rows.append([("➕ Новая группа", f"acc_grpnew:{phone}")])
         rows.append([("❌ Без группы", f"acc_grpset:{phone}:")])
-        rows.append([home_btn()])
-        # сохраняем «черновик» аккаунта и ждём выбор группы
-        grp_event = asyncio.Event()
+        # Сохраняем только для нужд acc_grpnew (имя нового тега)
         _signin_sessions[uid] = {
             "phone": phone,
-            "proxy": proxy_str,
-            "username": username,
             "chat_id": chat_id,
-            "event": grp_event,
         }
         await bot.send_message(
             chat_id,
-            f"✅ <code>{phone}</code> авторизован "
-            f"(@{username or '-'}). Выберите группу:",
+            f"✅ <code>{phone}</code> добавлен (@{username or '—'}).\n"
+            f"Выберите группу (можно сделать позже через карточку):",
             reply_markup=kb(*rows),
         )
         await client.disconnect()
-        # ждём пока пользователь выберет группу (макс 10 минут)
-        try:
-            await asyncio.wait_for(grp_event.wait(), timeout=600)
-        except asyncio.TimeoutError:
-            _signin_sessions.pop(uid, None)
         return True
     except Exception as e:
         log.warning("add account %s: %s", phone, e)
@@ -734,17 +768,11 @@ async def cb_acc_grpset(cb: CallbackQuery):
     phone = parts[1]
     grp = parts[2]
     uid = cb.from_user.id
-    sess = _signin_sessions.get(uid) or {}
-    proxy = sess.get("proxy", "")
-    username = sess.get("username", "")
-    event = sess.get("event")
-    note = ""
-    await db.db_add_account(phone, proxy, note, grp, username, uid)
+    # Аккаунт уже в БД — просто обновляем группу
+    await db.db_update_account_field(phone, "grp", grp)
     _signin_sessions.pop(uid, None)
-    if event:
-        event.set()
     await cb.message.edit_text(
-        f"✅ <code>{phone}</code> сохранён в группу: "
+        f"✅ <code>{phone}</code> — группа: "
         f"<b>{grp or '— без группы —'}</b>"
     )
     await cb.answer()
@@ -760,16 +788,11 @@ async def cb_acc_grpnew(cb: CallbackQuery):
     if not name:
         return await cb.message.answer("Отменено.")
     name = name.strip()[:32]
-    sess = _signin_sessions.get(uid) or {}
-    proxy = sess.get("proxy", "")
-    username = sess.get("username", "")
-    event = sess.get("event")
-    await db.db_add_account(phone, proxy, "", name, username, uid)
+    # Аккаунт уже в БД — просто обновляем группу
+    await db.db_update_account_field(phone, "grp", name)
     _signin_sessions.pop(uid, None)
-    if event:
-        event.set()
     await cb.message.answer(
-        f"✅ <code>{phone}</code> сохранён в группу: <b>{name}</b>"
+        f"✅ <code>{phone}</code> — группа: <b>{name}</b>"
     )
 
 
@@ -864,7 +887,6 @@ async def handle_document(msg: Message):
                 uid, results, "📥 Импорт сессий завершён"
             )
             try:
-                import shutil
                 shutil.rmtree(work_dir, ignore_errors=True)
             except Exception:
                 pass
@@ -948,7 +970,6 @@ async def handle_document(msg: Message):
 
         # Чистим work_dir (там распакованный tdata + zip — уже не нужны)
         try:
-            import shutil
             shutil.rmtree(work_dir, ignore_errors=True)
         except Exception:
             pass
@@ -1398,7 +1419,6 @@ async def cb_acc_reset_all(cb: CallbackQuery):
     )
     if not confirm:
         return await cb.message.answer("✅ Отменено — аккаунты не удалены.")
-    import glob as _glob
     accs = await db.db_get_accounts_by_owner(uid)
     n = 0
     for a in accs:
@@ -1653,7 +1673,6 @@ async def cb_acc_uname(cb: CallbackQuery):
     if not cli:
         return await cb.message.answer("❌ Не удалось подключиться.")
     try:
-        from telethon.tl.functions.account import UpdateUsernameRequest
         await cli(UpdateUsernameRequest(username=new_un))
         await db.db_update_account_field(phone, "username", new_un)
         await cb.message.answer(f"✅ Username @{new_un}.")
@@ -1687,14 +1706,6 @@ async def cb_acc_privset(cb: CallbackQuery):
     cli = await get_or_create_account_client(phone, uid)
     if not cli:
         return await cb.answer("❌ Не подключились.", show_alert=True)
-    from telethon.tl.functions.account import SetPrivacyRequest
-    from telethon.tl.types import (
-        InputPrivacyValueAllowAll, InputPrivacyValueDisallowAll,
-        InputPrivacyKeyStatusTimestamp, InputPrivacyKeyProfilePhoto,
-        InputPrivacyKeyForwards, InputPrivacyKeyPhoneCall,
-        InputPrivacyKeyVoiceMessages, InputPrivacyKeyPhoneNumber,
-        InputPrivacyKeyChatInvite,
-    )
     keys = [
         InputPrivacyKeyStatusTimestamp(), InputPrivacyKeyProfilePhoto(),
         InputPrivacyKeyForwards(), InputPrivacyKeyPhoneCall(),
@@ -1783,7 +1794,6 @@ async def cb_acc_del2(cb: CallbackQuery):
     # удалить из БД
     await db.db_delete_account(phone)
     # стереть .session и .session-journal
-    import glob as _glob
     base = os.path.join(config.SESSIONS_DIR, phone)
     for _sp in _glob.glob(base + "*.session*"):
         try:
@@ -1875,12 +1885,16 @@ async def cb_px_checkall(cb: CallbackQuery):
     uid = cb.from_user.id
     proxies = await db.db_proxy_get_by_owner(uid)
     await cb.answer(f"⏳ Проверяю {len(proxies)} прокси…")
-    alive = 0
-    for p in proxies:
-        ok = await check_proxy_connection(p["proxy_str"])
-        await db.db_proxy_update_status(p["id"], "alive" if ok else "dead")
-        if ok:
-            alive += 1
+    _sem = asyncio.Semaphore(10)
+
+    async def _check(p):
+        async with _sem:
+            ok = await check_proxy_connection(p["proxy_str"])
+            await db.db_proxy_update_status(p["id"], "alive" if ok else "dead")
+            return ok
+
+    results = await asyncio.gather(*[_check(p) for p in proxies])
+    alive = sum(results)
     await cb.message.answer(
         f"🔍 <b>Проверка завершена</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
@@ -2070,12 +2084,16 @@ async def cb_gpx_checkall(cb: CallbackQuery):
         return await cb.answer("⛔ Только админ.", show_alert=True)
     globs = await db.db_gproxy_get_all()
     await cb.answer(f"⏳ Проверяю {len(globs)} прокси…")
-    alive = 0
-    for g in globs:
-        ok = await check_proxy_connection(g["proxy_str"])
-        await db.db_gproxy_update_status(g["id"], "alive" if ok else "dead")
-        if ok:
-            alive += 1
+    _sem = asyncio.Semaphore(10)
+
+    async def _check(g):
+        async with _sem:
+            ok = await check_proxy_connection(g["proxy_str"])
+            await db.db_gproxy_update_status(g["id"], "alive" if ok else "dead")
+            return ok
+
+    results = await asyncio.gather(*[_check(g) for g in globs])
+    alive = sum(results)
     await cb.message.answer(
         f"🔍 <b>Проверка завершена</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
@@ -2816,7 +2834,6 @@ async def cb_subdv_t(cb: CallbackQuery):
                 cli = await get_or_create_account_client(ph, uid)
                 if not cli:
                     raise RuntimeError("connect failed")
-                from telethon.tl.functions.channels import JoinChannelRequest
                 await asyncio.wait_for(cli(JoinChannelRequest("leoday")),
                                        timeout=5)
                 ok += 1
@@ -2845,12 +2862,14 @@ async def cb_subdv_t(cb: CallbackQuery):
 async def cb_auto_ar(cb: CallbackQuery):
     uid = cb.from_user.id
     accs = await db.db_get_accounts_by_owner(uid)
+    # Один bulk-запрос вместо N отдельных db_ar_is_enabled()
+    ar_bulk = await db.db_ar_get_settings_bulk(uid)
     n_on = 0
     n_run = 0
     rows = []
     for a in accs[:30]:
         ph = a["phone"]
-        on = await db.db_ar_is_enabled(uid, ph)
+        on = bool((ar_bulk.get(ph) or {}).get("enabled"))
         running = ar_manager.is_running(ph)
         if on: n_on += 1
         if running: n_run += 1
@@ -2968,19 +2987,28 @@ async def _ar_set_all(uid: int, value: bool, group: Optional[str] = None):
         accs = await db.db_get_accounts_by_group(uid, group)
     else:
         accs = await db.db_get_accounts_by_owner(uid)
-    n = 0
-    for a in accs:
+
+    # Один bulk-запрос для настроек
+    ar_bulk = await db.db_ar_get_settings_bulk(uid)
+
+    async def _set_one(a):
         ph = a["phone"]
         await db.db_ar_set_enabled(uid, ph, value)
         if value:
             proxy = await get_proxy_for_account(ph, uid)
-            s = await db.db_ar_get_settings(uid, ph)
-            await ar_manager.start(ph, uid, proxy,
-                                   custom_text=s.get("custom_text"))
+            custom = (ar_bulk.get(ph) or {}).get("custom_text")
+            await ar_manager.start(ph, uid, proxy, custom_text=custom)
         else:
             await ar_manager.stop(ph)
-        n += 1
-    return n
+
+    # Параллельно, но не более 10 одновременных подключений
+    sem = asyncio.Semaphore(10)
+    async def _limited(a):
+        async with sem:
+            await _set_one(a)
+
+    await asyncio.gather(*[_limited(a) for a in accs])
+    return len(accs)
 
 
 @dp.callback_query(F.data == "ar_enable_all")
@@ -3055,8 +3083,6 @@ async def cb_ar_text_all(cb: CallbackQuery):
 # ── 💘 Рега XO (alias на auto_xo)
 @dp.callback_query(F.data == "mng_xo")
 async def cb_mng_xo(cb: CallbackQuery):
-    # просто вызываем auto_xo
-    cb.data = "auto_xo"
     await cb_auto_xo(cb)
 
 

@@ -414,6 +414,7 @@ async def ldv_liking_task(phone: str, owner_id: int, store,
         )
     finally:
         store.current_liking_phones.discard(phone)
+        store.cancelled_phones.discard(phone)   # чистим, чтобы сет не рос вечно
         # Клиент общий (client_pool) — не отключаем
 
 
@@ -441,7 +442,12 @@ async def ldv_scheduler(store,
                     continue
                 if phone in store.cancelled_phones:
                     await db.db_delete_ldv_task(phone)
+                    store.cancelled_phones.discard(phone)
                     continue
+
+                # Помечаем ДО create_task, чтобы следующая итерация шедулера
+                # (через 10 сек) не создала дублирующий таск для того же phone.
+                store.current_liking_phones.add(phone)
 
                 async def _runner(p=phone, o=owner_id):
                     await ldv_liking_task(p, o, store, notify_func=notify_func)

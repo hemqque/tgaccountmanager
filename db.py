@@ -10,6 +10,7 @@ db.py — Слой работы с базой данных (SQLite через ai
 import time
 import json
 import aiosqlite
+from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
 
 from config import DB_NAME, INITIAL_ADMIN_IDS
@@ -22,15 +23,26 @@ except Exception:
 
 
 # ─────────────────────────────────────────────────────────────────
+# Единый хелпер соединения: WAL + busy_timeout + Row factory везде
+# ─────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def _conn():
+    """
+    Async context manager для подключения к БД.
+    Гарантирует busy_timeout и Row factory для всех запросов.
+    """
+    async with _conn() as db:
+        yield db
+
+
+# ─────────────────────────────────────────────────────────────────
 # init_db: создаёт все таблицы, если их ещё нет, и загружает в admins
 # идентификаторы из INITIAL_ADMIN_IDS.
 # ─────────────────────────────────────────────────────────────────
 async def init_db() -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         # WAL-режим: параллельные читатели не блокируют писателей
         await db.execute("PRAGMA journal_mode=WAL")
-        # Ждать до 5 сек вместо немедленного «database is locked»
-        await db.execute("PRAGMA busy_timeout=5000")
         await db.executescript(
             """
             CREATE TABLE IF NOT EXISTS accounts(
@@ -107,6 +119,18 @@ async def init_db() -> None:
                 status     TEXT DEFAULT 'unknown',
                 added_at   REAL
             );
+
+            -- Индексы для горячих запросов (планировщики проверяют каждые 10 сек)
+            CREATE INDEX IF NOT EXISTS idx_ldv_pending
+                ON ldv_tasks(status, next_run);
+            CREATE INDEX IF NOT EXISTS idx_xo_pending
+                ON xo_tasks(status, next_run);
+            CREATE INDEX IF NOT EXISTS idx_acc_owner
+                ON accounts(owner_id);
+            CREATE INDEX IF NOT EXISTS idx_acc_grp
+                ON accounts(owner_id, grp);
+            CREATE INDEX IF NOT EXISTS idx_ar_owner
+                ON autoreply_settings(owner_id);
             """
         )
         # Загрузить начальных админов
@@ -131,7 +155,7 @@ async def init_db() -> None:
 
 async def db_add_account(phone: str, proxy: str, note: str, grp: str,
                          username: str, owner_id: int) -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute(
             "INSERT OR REPLACE INTO accounts(phone, proxy, note, grp, "
             "username, owner_id) VALUES (?,?,?,?,?,?)",
@@ -141,16 +165,14 @@ async def db_add_account(phone: str, proxy: str, note: str, grp: str,
 
 
 async def db_get_account(phone: str) -> Optional[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute("SELECT * FROM accounts WHERE phone=?", (phone,))
         row = await cur.fetchone()
         return dict(row) if row else None
 
 
 async def db_get_accounts_by_owner(owner_id: int) -> List[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute(
             "SELECT * FROM accounts WHERE owner_id=? ORDER BY phone", (owner_id,)
         )
@@ -159,8 +181,7 @@ async def db_get_accounts_by_owner(owner_id: int) -> List[Dict[str, Any]]:
 
 
 async def db_get_all_accounts() -> List[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute("SELECT * FROM accounts ORDER BY owner_id, phone")
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
@@ -169,7 +190,7 @@ async def db_get_all_accounts() -> List[Dict[str, Any]]:
 async def db_update_account_field(phone: str, field: str, value: Any) -> None:
     if field not in ("proxy", "note", "grp", "username"):
         raise ValueError(f"Bad field: {field}")
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute(
             f"UPDATE accounts SET {field}=? WHERE phone=?", (value, phone)
         )
@@ -177,7 +198,7 @@ async def db_update_account_field(phone: str, field: str, value: Any) -> None:
 
 
 async def db_delete_account(phone: str) -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute("DELETE FROM accounts WHERE phone=?", (phone,))
         await db.execute("DELETE FROM ldv_tasks WHERE phone=?", (phone,))
         await db.execute("DELETE FROM xo_tasks WHERE phone=?", (phone,))
@@ -187,7 +208,7 @@ async def db_delete_account(phone: str) -> None:
 
 
 async def db_get_groups_by_owner(owner_id: int) -> List[str]:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         cur = await db.execute(
             "SELECT DISTINCT grp FROM accounts WHERE owner_id=? AND grp IS NOT NULL "
             "AND grp<>'' ORDER BY grp", (owner_id,)
@@ -197,8 +218,7 @@ async def db_get_groups_by_owner(owner_id: int) -> List[str]:
 
 
 async def db_get_accounts_by_group(owner_id: int, grp: str) -> List[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute(
             "SELECT * FROM accounts WHERE owner_id=? AND grp=? ORDER BY phone",
             (owner_id, grp),
@@ -213,7 +233,7 @@ async def db_get_accounts_by_group(owner_id: int, grp: str) -> List[Dict[str, An
 
 async def db_schedule_ldv_task(phone: str, owner_id: int, next_run: float,
                                step: int = 0, status: str = "pending") -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute(
             "INSERT OR REPLACE INTO ldv_tasks(phone, step, next_run, status, "
             "owner_id) VALUES (?,?,?,?,?)",
@@ -223,8 +243,7 @@ async def db_schedule_ldv_task(phone: str, owner_id: int, next_run: float,
 
 
 async def db_get_pending_ldv_tasks() -> List[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute(
             "SELECT * FROM ldv_tasks WHERE status='pending' AND next_run<=?",
             (time.time(),),
@@ -234,8 +253,7 @@ async def db_get_pending_ldv_tasks() -> List[Dict[str, Any]]:
 
 
 async def db_get_ldv_tasks_by_owner(owner_id: int) -> List[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute(
             "SELECT * FROM ldv_tasks WHERE owner_id=? ORDER BY next_run",
             (owner_id,),
@@ -257,7 +275,7 @@ async def db_update_ldv_task(phone: str, step: Optional[int] = None,
     if not sets:
         return
     args.append(phone)
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute(
             f"UPDATE ldv_tasks SET {', '.join(sets)} WHERE phone=?", args
         )
@@ -265,13 +283,13 @@ async def db_update_ldv_task(phone: str, step: Optional[int] = None,
 
 
 async def db_delete_ldv_task(phone: str) -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute("DELETE FROM ldv_tasks WHERE phone=?", (phone,))
         await db.commit()
 
 
 async def db_delete_ldv_tasks_by_owner(owner_id: int) -> int:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         cur = await db.execute(
             "DELETE FROM ldv_tasks WHERE owner_id=?", (owner_id,)
         )
@@ -280,7 +298,7 @@ async def db_delete_ldv_tasks_by_owner(owner_id: int) -> int:
 
 
 async def db_delete_ldv_tasks_by_group(owner_id: int, grp: str) -> int:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         cur = await db.execute(
             "DELETE FROM ldv_tasks WHERE owner_id=? AND phone IN "
             "(SELECT phone FROM accounts WHERE owner_id=? AND grp=?)",
@@ -296,7 +314,7 @@ async def db_delete_ldv_tasks_by_group(owner_id: int, grp: str) -> int:
 
 async def db_schedule_xo_task(phone: str, owner_id: int, next_run: float,
                               status: str = "pending") -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute(
             "INSERT OR REPLACE INTO xo_tasks(phone, next_run, status, owner_id) "
             "VALUES (?,?,?,?)",
@@ -306,8 +324,7 @@ async def db_schedule_xo_task(phone: str, owner_id: int, next_run: float,
 
 
 async def db_get_pending_xo_tasks() -> List[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute(
             "SELECT * FROM xo_tasks WHERE status='pending' AND next_run<=?",
             (time.time(),),
@@ -317,8 +334,7 @@ async def db_get_pending_xo_tasks() -> List[Dict[str, Any]]:
 
 
 async def db_get_xo_tasks_by_owner(owner_id: int) -> List[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute(
             "SELECT * FROM xo_tasks WHERE owner_id=? ORDER BY next_run",
             (owner_id,),
@@ -337,7 +353,7 @@ async def db_update_xo_task(phone: str, next_run: Optional[float] = None,
     if not sets:
         return
     args.append(phone)
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute(
             f"UPDATE xo_tasks SET {', '.join(sets)} WHERE phone=?", args
         )
@@ -345,7 +361,7 @@ async def db_update_xo_task(phone: str, next_run: Optional[float] = None,
 
 
 async def db_delete_xo_task(phone: str) -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute("DELETE FROM xo_tasks WHERE phone=?", (phone,))
         await db.commit()
 
@@ -355,7 +371,7 @@ async def db_delete_xo_task(phone: str) -> None:
 # =================================================================
 
 async def db_whitelist_add(user_id: int, username: str = "") -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute(
             "INSERT OR REPLACE INTO whitelist(user_id, username, added_at) "
             "VALUES (?,?,?)", (user_id, username, time.time())
@@ -364,22 +380,20 @@ async def db_whitelist_add(user_id: int, username: str = "") -> None:
 
 
 async def db_whitelist_remove(user_id: int) -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute("DELETE FROM whitelist WHERE user_id=?", (user_id,))
         await db.commit()
 
 
 async def db_whitelist_get_all() -> List[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute("SELECT * FROM whitelist ORDER BY added_at DESC")
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
 
 async def db_whitelist_check(user_id: int) -> bool:
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("PRAGMA busy_timeout=5000")
+    async with _conn() as db:
         cur = await db.execute(
             "SELECT 1 FROM whitelist WHERE user_id=?", (user_id,)
         )
@@ -387,7 +401,7 @@ async def db_whitelist_check(user_id: int) -> bool:
 
 
 async def db_admins_add(user_id: int) -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute(
             "INSERT OR IGNORE INTO admins(user_id, added_at) VALUES (?,?)",
             (user_id, time.time())
@@ -396,22 +410,20 @@ async def db_admins_add(user_id: int) -> None:
 
 
 async def db_admins_remove(user_id: int) -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute("DELETE FROM admins WHERE user_id=?", (user_id,))
         await db.commit()
 
 
 async def db_admins_get_all() -> List[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute("SELECT * FROM admins ORDER BY added_at")
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
 
 async def db_admins_check(user_id: int) -> bool:
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("PRAGMA busy_timeout=5000")
+    async with _conn() as db:
         cur = await db.execute(
             "SELECT 1 FROM admins WHERE user_id=?", (user_id,)
         )
@@ -423,7 +435,7 @@ async def db_admins_check(user_id: int) -> bool:
 # =================================================================
 
 async def db_proxy_add(owner_id: int, proxy_str: str, note: str = "") -> int:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         cur = await db.execute(
             "INSERT INTO user_proxies(owner_id, proxy_str, note, status, added_at) "
             "VALUES (?,?,?,?,?)",
@@ -434,8 +446,7 @@ async def db_proxy_add(owner_id: int, proxy_str: str, note: str = "") -> int:
 
 
 async def db_proxy_get_by_id(proxy_id: int) -> Optional[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute(
             "SELECT * FROM user_proxies WHERE id=?", (proxy_id,)
         )
@@ -444,8 +455,7 @@ async def db_proxy_get_by_id(proxy_id: int) -> Optional[Dict[str, Any]]:
 
 
 async def db_proxy_get_by_owner(owner_id: int) -> List[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute(
             "SELECT * FROM user_proxies WHERE owner_id=? ORDER BY id", (owner_id,)
         )
@@ -454,8 +464,7 @@ async def db_proxy_get_by_owner(owner_id: int) -> List[Dict[str, Any]]:
 
 
 async def db_proxy_get_alive(owner_id: int) -> List[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute(
             "SELECT * FROM user_proxies WHERE owner_id=? AND status='alive'",
             (owner_id,),
@@ -465,7 +474,7 @@ async def db_proxy_get_alive(owner_id: int) -> List[Dict[str, Any]]:
 
 
 async def db_proxy_update_status(proxy_id: int, status: str) -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute(
             "UPDATE user_proxies SET status=? WHERE id=?", (status, proxy_id)
         )
@@ -473,7 +482,7 @@ async def db_proxy_update_status(proxy_id: int, status: str) -> None:
 
 
 async def db_proxy_update_note(proxy_id: int, note: str) -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute(
             "UPDATE user_proxies SET note=? WHERE id=?", (note, proxy_id)
         )
@@ -481,7 +490,7 @@ async def db_proxy_update_note(proxy_id: int, note: str) -> None:
 
 
 async def db_proxy_delete(proxy_id: int) -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute("DELETE FROM user_proxies WHERE id=?", (proxy_id,))
         await db.commit()
 
@@ -491,7 +500,7 @@ async def db_proxy_delete(proxy_id: int) -> None:
 # =================================================================
 
 async def db_ar_set_enabled(owner_id: int, phone: str, enabled: bool) -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute(
             "INSERT INTO autoreply_settings(owner_id, phone, enabled, custom_text) "
             "VALUES (?,?,?, COALESCE((SELECT custom_text FROM autoreply_settings "
@@ -504,7 +513,7 @@ async def db_ar_set_enabled(owner_id: int, phone: str, enabled: bool) -> None:
 
 async def db_ar_set_custom_text(owner_id: int, phone: str,
                                 custom_text: Optional[str]) -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute(
             "INSERT INTO autoreply_settings(owner_id, phone, enabled, custom_text) "
             "VALUES (?,?, COALESCE((SELECT enabled FROM autoreply_settings "
@@ -517,8 +526,7 @@ async def db_ar_set_custom_text(owner_id: int, phone: str,
 
 
 async def db_ar_get_settings(owner_id: int, phone: str) -> Dict[str, Any]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute(
             "SELECT * FROM autoreply_settings WHERE owner_id=? AND phone=?",
             (owner_id, phone),
@@ -538,8 +546,7 @@ async def db_ar_is_enabled(owner_id: int, phone: str) -> bool:
 async def db_ar_get_enabled_phones() -> List[Dict[str, Any]]:
     """Возвращает все enabled-пары (owner_id, phone, custom_text) — для запуска
     автоответов при старте процесса."""
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute(
             "SELECT owner_id, phone, custom_text FROM autoreply_settings "
             "WHERE enabled=1"
@@ -549,7 +556,7 @@ async def db_ar_get_enabled_phones() -> List[Dict[str, Any]]:
 
 
 async def db_ar_get_enabled_phones_by_owner(owner_id: int) -> List[str]:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         cur = await db.execute(
             "SELECT phone FROM autoreply_settings WHERE owner_id=? AND enabled=1",
             (owner_id,),
@@ -558,13 +565,27 @@ async def db_ar_get_enabled_phones_by_owner(owner_id: int) -> List[str]:
         return [r[0] for r in rows]
 
 
+async def db_ar_get_settings_bulk(owner_id: int) -> Dict[str, Dict[str, Any]]:
+    """
+    Возвращает {phone: settings_dict} для всех аккаунтов владельца одним запросом.
+    Вместо N отдельных db_ar_get_settings() при отрисовке списка автоответов.
+    """
+    async with _conn() as db:
+        cur = await db.execute(
+            "SELECT phone, enabled, custom_text "
+            "FROM autoreply_settings WHERE owner_id=?",
+            (owner_id,),
+        )
+        rows = await cur.fetchall()
+        return {r["phone"]: dict(r) for r in rows}
+
+
 # =================================================================
 # ── USER SETTINGS ────────────────────────────────────────────────
 # =================================================================
 
 async def db_user_settings_get(owner_id: int) -> Dict[str, Any]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute(
             "SELECT * FROM user_settings WHERE owner_id=?", (owner_id,)
         )
@@ -575,7 +596,7 @@ async def db_user_settings_get(owner_id: int) -> Dict[str, Any]:
 
 
 async def db_user_settings_set_logs(owner_id: int, enabled: bool) -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute(
             "INSERT INTO user_settings(owner_id, logs_enabled) VALUES (?,?) "
             "ON CONFLICT(owner_id) DO UPDATE SET logs_enabled=excluded.logs_enabled",
@@ -590,7 +611,7 @@ async def db_user_settings_set_logs(owner_id: int, enabled: bool) -> None:
 
 async def db_save_reg_state(phone: str, bot: str, step: int,
                             data: Dict[str, Any], owner_id: int) -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute(
             "INSERT OR REPLACE INTO reg_state(phone, bot, step, data_json, "
             "owner_id, updated_at) VALUES (?,?,?,?,?,?)",
@@ -601,8 +622,7 @@ async def db_save_reg_state(phone: str, bot: str, step: int,
 
 
 async def db_get_reg_state(phone: str, bot: str) -> Optional[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute(
             "SELECT * FROM reg_state WHERE phone=? AND bot=?", (phone, bot)
         )
@@ -618,7 +638,7 @@ async def db_get_reg_state(phone: str, bot: str) -> Optional[Dict[str, Any]]:
 
 
 async def db_delete_reg_state(phone: str, bot: str) -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute(
             "DELETE FROM reg_state WHERE phone=? AND bot=?", (phone, bot)
         )
@@ -634,7 +654,7 @@ async def db_gproxy_add(proxy_str: str, note: str = "") -> Optional[int]:
     Добавляет глобальный прокси. Возвращает id новой записи, либо
     None если такой proxy_str уже есть (UNIQUE).
     """
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         try:
             cur = await db.execute(
                 "INSERT INTO global_proxies(proxy_str, note, status, added_at) "
@@ -648,8 +668,7 @@ async def db_gproxy_add(proxy_str: str, note: str = "") -> Optional[int]:
 
 
 async def db_gproxy_get_by_id(proxy_id: int) -> Optional[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute(
             "SELECT * FROM global_proxies WHERE id=?", (proxy_id,)
         )
@@ -658,16 +677,14 @@ async def db_gproxy_get_by_id(proxy_id: int) -> Optional[Dict[str, Any]]:
 
 
 async def db_gproxy_get_all() -> List[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute("SELECT * FROM global_proxies ORDER BY id")
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
 
 async def db_gproxy_get_alive() -> List[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
+    async with _conn() as db:
         cur = await db.execute(
             "SELECT * FROM global_proxies WHERE status='alive' ORDER BY id"
         )
@@ -676,7 +693,7 @@ async def db_gproxy_get_alive() -> List[Dict[str, Any]]:
 
 
 async def db_gproxy_update_status(proxy_id: int, status: str) -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute(
             "UPDATE global_proxies SET status=? WHERE id=?", (status, proxy_id)
         )
@@ -684,7 +701,7 @@ async def db_gproxy_update_status(proxy_id: int, status: str) -> None:
 
 
 async def db_gproxy_update_note(proxy_id: int, note: str) -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute(
             "UPDATE global_proxies SET note=? WHERE id=?", (note, proxy_id)
         )
@@ -692,6 +709,6 @@ async def db_gproxy_update_note(proxy_id: int, note: str) -> None:
 
 
 async def db_gproxy_delete(proxy_id: int) -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with _conn() as db:
         await db.execute("DELETE FROM global_proxies WHERE id=?", (proxy_id,))
         await db.commit()

@@ -1,0 +1,28 @@
+# Секреты — никогда не коммитить
+.env
+
+# База данных
+*.db
+*.db-wal
+*.db-shm
+
+# Сессии Telethon
+sessions/
+*.session
+*.session-journal
+
+# Временные файлы
+temp/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Логи
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp

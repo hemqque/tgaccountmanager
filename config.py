@@ -2,32 +2,39 @@
 """
 config.py — Глобальная конфигурация менеджера фермы Telegram-аккаунтов.
 
-ВНИМАНИЕ: Перед запуском заполните API_ID, API_HASH, BOT_TOKEN и
-INITIAL_ADMIN_IDS своими значениями.
+Все секреты читаются из файла .env (python-dotenv).
+Скопируйте .env.example → .env и заполните своими значениями.
 """
+
+import os
+from dotenv import load_dotenv
+
+# Загружаем .env из текущей директории (если есть)
+load_dotenv()
+
+
+def _int_list(s: str) -> list:
+    """Парсит строку '123,456' в [123, 456]."""
+    return [int(x.strip()) for x in s.split(",") if x.strip().lstrip("-").isdigit()]
+
 
 # ───────────────────────── Telegram API ─────────────────────────
 # Получить можно на https://my.telegram.org
-API_ID = 26318226                     # int — ваш api_id
-API_HASH = "0dfda2bf696e5a6fd95bd445bd4d26fe"   # str — ваш api_hash
+API_ID   = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
 
 # Токен бота-менеджера (от @BotFather)
-BOT_TOKEN = "8700734986:AAExMjaJHuyl4gzaA8TU-nQNc2ftpNBsEGo"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 # ───────────────────────── База данных ──────────────────────────
 DB_NAME = "manager.db"
 
 # ───────────────────────── Доступ ───────────────────────────────
-# Изначальные админы — захардкодены, остальные добавляются через UI
-INITIAL_ADMIN_IDS = [
-    1011624012,
-]
+# Изначальные админы — захардкодены в .env, остальные добавляются через UI
+INITIAL_ADMIN_IDS = _int_list(os.getenv("INITIAL_ADMIN_IDS", ""))
 
 # Изначальный whitelist — могут пользоваться ботом (без прав админа).
-# При старте записываются в таблицу whitelist (если их там ещё нет).
-INITIAL_WHITELIST_IDS = [
-    1011624012,
-]
+INITIAL_WHITELIST_IDS = _int_list(os.getenv("INITIAL_WHITELIST_IDS", ""))
 
 # ───────────────────────── Каналы для авто-подписки ─────────────
 # На эти каналы юзерботы подписываются после успешной авторизации
