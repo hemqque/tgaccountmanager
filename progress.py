@@ -149,8 +149,8 @@ async def _finish_progress(bot: Bot, uid: int, store,
     n_ok = max(0, state["done"] - n_err)
     title = state.get("title") or "Прогресс"
 
-    bar_full = OK_CH * BAR_WIDTH if n_err == 0 else (
-        OK_CH * max(0, BAR_WIDTH - 1) + ERR_CH
+    bar_full = OK_CH * total if n_err == 0 else (
+        OK_CH * max(0, total - n_err) + ERR_CH * min(n_err, total)
     )
     text = (
         f"✅ <b>{title} завершён</b>\n"

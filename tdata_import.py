@@ -225,28 +225,16 @@ async def import_one_tdata(tdata_folder: str,
     Convert one tdata folder to Telethon session.
     Returns (phone, session_path, error).
 
-    ВАЖНО: opentele 1.15.x бросает OpenTeleException(BaseException),
-    т.е. он НЕ ловится обычным `except Exception`. Поэтому всё, что
-    касается opentele, обернуто в `except BaseException`.
+    opentele запускается в отдельном subprocess (tdata_worker.py), чтобы
+    Qt-краш не убивал основной процесс бота.
     """
     import sys as _sys
-    _prev_limit = _sys.getrecursionlimit()
-    if _prev_limit < 5000:
-        _sys.setrecursionlimit(5000)
 
-    # 0) Предварительная валидация — отсекает битые папки без opentele.
+    tdata_folder = os.path.abspath(tdata_folder).replace('\\', '/')
+
     err = validate_tdata_structure(tdata_folder)
     if err:
         return None, None, f"структура: {err}"
-
-    # Применяем patch-набор для opentele (kMaxAccounts + resilient read).
-    _patch_opentele()
-
-    try:
-        from opentele.td import TDesktop
-        from opentele.api import UseCurrentSession
-    except ImportError as e:
-        return None, None, f"opentele not installed: {e}"
 
     os.makedirs(sessions_dir, exist_ok=True)
     tmp_session = os.path.join(
@@ -260,81 +248,100 @@ async def import_one_tdata(tdata_folder: str,
         except Exception:
             pass
 
-    # 1) Конвертация tdata → Telethon. opentele работает синхронно и
-    #    может зависнуть/уйти в долгую рекурсию — выносим вызов в
-    #    отдельный thread с таймаутом, чтобы не блокировать event loop.
-    client = None
-
-    def _sync_load_and_convert():
-        """Синхронная часть: TDesktop() + блокирующий рекурсивный декрипт."""
-        tdesk_local = TDesktop(tdata_folder)
-        if not tdesk_local.isLoaded():
-            return None, "TDesktop did not load (corrupt tdata?)"
-        return tdesk_local, None
-
+    # 1) Конвертация tdata → .session через subprocess (Qt-safe)
+    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "tdata_worker.py")
     try:
-        tdesk_or_none, err = await asyncio.wait_for(
-            asyncio.to_thread(_sync_load_and_convert),
-            timeout=20,
+        proc = await asyncio.create_subprocess_exec(
+            _sys.executable, worker, tdata_folder, tmp_session,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-    except asyncio.TimeoutError:
-        return None, None, ("opentele зависла (>20с) — tdata несовместима "
-                            "с opentele 1.15")
-    except RecursionError:
-        return None, None, "opentele recursion overflow"
-    except (Exception, BaseException) as e:
-        if isinstance(e, (KeyboardInterrupt, SystemExit)):
-            raise
-        return None, None, f"TDesktop: {str(e)[:160]}"
-
-    if err:
-        return None, None, err
-    tdesk = tdesk_or_none
-
-    # ToTelethon — async, но внутри тоже может быть синхронный декрипт.
-    # Тоже даём таймаут.
-    try:
-        client = await asyncio.wait_for(
-            tdesk.ToTelethon(
-                session=tmp_session,
-                flag=UseCurrentSession,
-                proxy=proxy,
-            ),
-            timeout=30,
-        )
-    except asyncio.TimeoutError:
-        return None, None, "ToTelethon зависла (>30с)"
-    except RecursionError:
-        return None, None, "ToTelethon recursion overflow"
-    except (Exception, BaseException) as e:
-        if isinstance(e, (KeyboardInterrupt, SystemExit)):
-            raise
-        return None, None, f"ToTelethon: {str(e)[:160]}"
-
-    # 2) Connect + get_me
-    try:
-        await asyncio.wait_for(client.connect(), timeout=timeout)
-        if not await client.is_user_authorized():
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=60.0
+            )
+        except asyncio.TimeoutError:
             try:
-                await client.disconnect()
+                proc.kill()
+                await proc.wait()
             except Exception:
                 pass
-            return None, None, "session not authorized"
+            return None, None, "tdata_worker timeout (>60с)"
+
+        if stderr:
+            for line in stderr.decode(errors="replace").splitlines():
+                if line.strip():
+                    log.info("worker: %s", line.strip())
+
+        raw = stdout.decode(errors="replace").strip()
+        if not raw:
+            return None, None, f"worker вернул пустой вывод (exit {proc.returncode})"
+
+        import json as _json
+        try:
+            result = _json.loads(raw)
+        except Exception:
+            return None, None, f"worker bad output: {raw[:120]}"
+
+        if not result.get("ok"):
+            return None, None, result.get("error", "worker: unknown error")
+
+    except Exception as e:
+        return None, None, f"subprocess: {e}"
+
+    # 2) Connect + get_me в основном процессе (сессия уже лежит на диске)
+    import config as _cfg
+    from telethon import TelegramClient
+
+    proxy_telethon = None
+    if proxy:
+        try:
+            from global_proxy import proxy_to_telethon
+            proxy_telethon = proxy_to_telethon(proxy)
+        except Exception:
+            pass
+
+    client = TelegramClient(tmp_session, _cfg.API_ID, _cfg.API_HASH,
+                            proxy=proxy_telethon)
+
+    async def _connect_and_get_me():
+        await client.connect()
+        if not await client.is_user_authorized():
+            return None, "session not authorized"
         me = await client.get_me()
         phone = ("+" + me.phone) if (me and me.phone) else None
+        return phone, None
+
+    try:
+        phone, auth_err = await asyncio.wait_for(
+            _connect_and_get_me(), timeout=timeout
+        )
         try:
             await client.disconnect()
         except Exception:
             pass
-    except RecursionError:
+        if auth_err:
+            for ext in (".session", ".session-journal"):
+                try:
+                    if os.path.exists(tmp_session + ext):
+                        os.remove(tmp_session + ext)
+                except Exception:
+                    pass
+            return None, None, auth_err
+    except asyncio.TimeoutError:
         try:
             await client.disconnect()
         except Exception:
             pass
-        return None, None, "connect/get_me recursion overflow"
-    except (Exception, BaseException) as e:  # noqa: B902
-        if isinstance(e, (KeyboardInterrupt, SystemExit)):
-            raise
+        for ext in (".session", ".session-journal"):
+            try:
+                if os.path.exists(tmp_session + ext):
+                    os.remove(tmp_session + ext)
+            except Exception:
+                pass
+        return None, None, f"connect/get_me зависло (>{timeout:.0f}с)"
+    except Exception as e:
         try:
             await client.disconnect()
         except Exception:
@@ -523,14 +530,23 @@ async def import_one_session(src_session: str,
     session_base = os.path.join(sessions_dir, tmp_name)
     client = TelegramClient(session_base, api_id, api_hash, proxy=tproxy)
 
-    try:
-        await asyncio.wait_for(client.connect(), timeout=timeout)
+    async def _connect_and_get_me_session():
+        await client.connect()
         if not await client.is_user_authorized():
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-            # удалим tmp
+            return None, "session not authorized"
+        me = await client.get_me()
+        phone = ("+" + me.phone) if (me and me.phone) else None
+        return phone, None
+
+    try:
+        phone, auth_err = await asyncio.wait_for(
+            _connect_and_get_me_session(), timeout=timeout
+        )
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        if auth_err:
             for ext in (".session", ".session-journal"):
                 p = os.path.join(sessions_dir, tmp_name + ext)
                 try:
@@ -538,13 +554,20 @@ async def import_one_session(src_session: str,
                         os.remove(p)
                 except Exception:
                     pass
-            return None, None, "session not authorized"
-        me = await client.get_me()
-        phone = ("+" + me.phone) if (me and me.phone) else None
+            return None, None, auth_err
+    except asyncio.TimeoutError:
         try:
             await client.disconnect()
         except Exception:
             pass
+        for ext in (".session", ".session-journal"):
+            p = os.path.join(sessions_dir, tmp_name + ext)
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        return None, None, f"connect/get_me зависло (>{timeout:.0f}с)"
     except Exception as e:
         try:
             await client.disconnect()

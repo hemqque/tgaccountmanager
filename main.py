@@ -47,9 +47,9 @@ import config
 import db
 import utils
 from utils import (
-    is_allowed, restore_main_menu, ask_with_cancel, validate_phone,
-    validate_proxy, safe_delete_folder, auto_join_channels, rand_sleep,
-    main_menu_keyboard, attach_pending_router, has_pending,
+    is_allowed, restore_main_menu, ask_with_cancel, ask_with_retry,
+    validate_phone, validate_proxy, safe_delete_folder, auto_join_channels,
+    rand_sleep, main_menu_keyboard, attach_pending_router, has_pending,
     register_pending_text, cancel_pending_ask,
 )
 from store import Store
@@ -69,6 +69,7 @@ from global_proxy import (
 from ldv_functions import (
     register_one_ldv, ldv_liking_task, ldv_scheduler, ldv_attach_listener,
 )
+from client_pool import session_watchdog as _session_watchdog
 from xo_functions import (
     register_one_xo, xo_liking_task, xo_liking_scheduler,
 )
@@ -187,6 +188,14 @@ async def access_middleware(handler, event, data):
         return await handler(event, data)
 
     # отказ
+    update_type = (
+        "message" if event.message else
+        "callback_query" if event.callback_query else
+        "inline_query" if event.inline_query else "other"
+    )
+    log.warning("access_middleware: denied uid=%s type=%s chat=%s",
+                uid, update_type,
+                getattr(msg_or_cb, "chat", {}) if msg_or_cb else None)
     try:
         if isinstance(msg_or_cb, Message):
             await msg_or_cb.answer("⛔ У вас нет доступа к этому боту.")
@@ -202,7 +211,7 @@ async def access_middleware(handler, event, data):
 # =================================================================
 # должен идти ПЕРВЫМ, чтобы отлавливать текст ДО других хендлеров.
 pending_router = Router(name="pending")
-attach_pending_router(pending_router)
+attach_pending_router(pending_router, store)
 dp.include_router(pending_router)
 
 
@@ -212,25 +221,16 @@ dp.include_router(pending_router)
 @dp.callback_query.outer_middleware()
 async def _callback_guard_mw(handler, event: CallbackQuery, data):
     """
-    Middleware-страж: блокирует callback-и (кроме action_cancel) у
-    пользователей с активным действием. В aiogram 3.x обычный handler
-    «съел бы» все callback-ы — поэтому используем middleware, которое
-    может либо позвать next handler, либо ответить alert и НЕ звать.
+    Middleware-страж: любая кнопка имеет высший приоритет.
+    Если у пользователя висит pending-ввод (ask_with_retry/cancel) —
+    он отменяется, action сбрасывается, и кнопка выполняется.
     """
     if not event.data:
         return await handler(event, data)
-    if event.data == "action_cancel":
-        return await handler(event, data)
     uid = event.from_user.id if event.from_user else 0
-    if uid and store.is_busy(uid):
-        try:
-            await event.answer(
-                "⏳ Завершите текущее действие или нажмите 'Главное меню'.",
-                show_alert=True,
-            )
-        except Exception:
-            pass
-        return  # не передаём дальше
+    if uid:
+        cancel_pending_ask(uid)
+        store.set_action(uid, None)
     return await handler(event, data)
 
 
@@ -272,8 +272,6 @@ async def cb_action_cancel(cb: CallbackQuery):
 # =================================================================
 @dp.message(F.text == "⚙️ Аккаунты")
 async def handle_section_accounts(msg: Message):
-    if has_pending(msg.from_user.id):  # не мешать ask_with_cancel
-        return
     await msg.answer(
         "⚙️ <b>Аккаунты</b>",
         reply_markup=kb(
@@ -311,8 +309,6 @@ async def cb_acc_apply_global(cb: CallbackQuery):
 
 @dp.message(F.text == "🤖 Автоматизация")
 async def handle_section_auto(msg: Message):
-    if has_pending(msg.from_user.id):
-        return
     await msg.answer(
         "🤖 <b>Автоматизация</b>",
         reply_markup=kb(
@@ -328,14 +324,12 @@ async def handle_section_auto(msg: Message):
 
 @dp.message(F.text == "📊 Управление")
 async def handle_section_manage(msg: Message):
-    if has_pending(msg.from_user.id):
-        return
     await msg.answer(
         "📊 <b>Управление</b>",
         reply_markup=kb(
-            [("💘 Рега XO", "mng_xo")],
             [("❤️ Ручной пролайк ДВ", "mng_manual_ldv")],
-            [("⚙️ Управление лайкингом", "mng_ldv")],
+            [("💘 Ручной пролайк XO", "mng_manual_xo")],
+            [("⚙️ Управление лайкингом ДВ", "mng_ldv")],
             [("💘 Управление XO", "mng_xo_panel")],
             [("🛑 Отмена регистрации", "mng_regcancel")],
             [home_btn()],
@@ -345,8 +339,6 @@ async def handle_section_manage(msg: Message):
 
 @dp.message(F.text == "📈 Прогресс")
 async def handle_section_progress(msg: Message):
-    if has_pending(msg.from_user.id):
-        return
     uid = msg.from_user.id
     s = task_queue.status()
     accs = await db.db_get_accounts_by_owner(uid)
@@ -389,8 +381,6 @@ async def cb_prog_logs_toggle(cb: CallbackQuery):
 
 @dp.message(F.text == "👑 Админ")
 async def handle_section_admin(msg: Message):
-    if has_pending(msg.from_user.id):
-        return
     if not await db.db_admins_check(msg.from_user.id):
         return await msg.answer("⛔ Нет доступа.")
     await msg.answer(
@@ -460,15 +450,20 @@ async def cb_acc_add(cb: CallbackQuery):
     store.set_action(uid, "acc_add")
     await cb.answer()
 
+    def _has_phones(text: str) -> bool:
+        return any(validate_phone(t.strip())
+                   for t in re.split(r"[,\n;]+", text) if t.strip())
+
     try:
-        raw = await ask_with_cancel(
+        raw = await ask_with_retry(
             bot, cb.message.chat.id, uid,
             "📱 Пришлите номера телефонов (через запятую или с новой строки).\n"
             "Пример:\n+79991112233\n+79994445566",
+            validator=_has_phones,
+            error_msg="❌ Не нашёл валидных номеров. Формат: +79991112233",
         )
         if raw is None:
-            await restore_main_menu(bot, cb.message.chat.id, uid,
-                                    "Отменено.")
+            await restore_main_menu(bot, cb.message.chat.id, uid, "Отменено.")
             return
         phones = []
         for tok in re.split(r"[,\n;]+", raw):
@@ -477,12 +472,7 @@ async def cb_acc_add(cb: CallbackQuery):
                 p = validate_phone(tok)
                 if p:
                     phones.append(p)
-        # дедуп
         phones = list(dict.fromkeys(phones))
-        if not phones:
-            await bot.send_message(uid, "❌ Не нашёл валидных номеров.")
-            await restore_main_menu(bot, cb.message.chat.id, uid)
-            return
 
         _batch_cancel[uid] = False
         cancel_msg = await bot.send_message(
@@ -537,16 +527,15 @@ async def cb_acc_add(cb: CallbackQuery):
 async def _add_one_account(uid: int, chat_id: int, phone: str) -> bool:
     """Полный сценарий добавления одного аккаунта. True/False."""
     # 1. proxy
-    proxy_raw = await ask_with_cancel(
+    proxy_raw = await ask_with_retry(
         bot, chat_id, uid,
-        f"🛡 Прокси для <code>{phone}</code> "
-        f"(host:port:user:pass или «Нет»):",
+        f"🛡 Прокси для <code>{phone}</code> (host:port:user:pass или «Нет»):",
+        validator=validate_proxy,
+        error_msg="❌ Некорректный формат. Введите host:port:user:pass или «Нет».",
+        parse_mode="HTML",
     )
     if proxy_raw is None:
         await bot.send_message(uid, f"⏭ Пропущено: {phone}")
-        return False
-    if not validate_proxy(proxy_raw):
-        await bot.send_message(uid, f"❌ {phone}: некорректный прокси.")
         return False
     if proxy_raw.strip().lower() in ("нет", "no", "none", "-", "без прокси"):
         g = await get_sticky_global_proxy(phone)
@@ -566,29 +555,53 @@ async def _add_one_account(uid: int, chat_id: int, phone: str) -> bool:
             await bot.send_message(uid, f"ℹ️ {phone}: уже авторизован.")
         else:
             sent = await client.send_code_request(phone)
-            code = await ask_with_cancel(
-                bot, chat_id, uid,
-                f"🔢 Введите SMS-код для <code>{phone}</code>:",
-            )
-            if not code:
-                await bot.send_message(uid, f"⏭ Отменено: {phone}")
-                await client.disconnect()
-                return False
-            try:
-                await client.sign_in(phone=phone, code=code.strip(),
-                                     phone_code_hash=sent.phone_code_hash)
-            except SessionPasswordNeededError:
-                pwd = await ask_with_cancel(
+            signed_in = False
+            for code_attempt in range(5):
+                code = await ask_with_cancel(
                     bot, chat_id, uid,
-                    f"🔐 2FA-пароль для <code>{phone}</code>:",
+                    f"🔢 Введите SMS-код для <code>{phone}</code>:",
+                    parse_mode="HTML",
                 )
-                if not pwd:
+                if not code:
                     await bot.send_message(uid, f"⏭ Отменено: {phone}")
                     await client.disconnect()
                     return False
-                await client.sign_in(password=pwd)
-            except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
-                await bot.send_message(uid, f"❌ {phone}: {e}")
+                try:
+                    await client.sign_in(phone=phone, code=code.strip(),
+                                         phone_code_hash=sent.phone_code_hash)
+                    signed_in = True
+                    break
+                except SessionPasswordNeededError:
+                    for pwd_attempt in range(5):
+                        pwd = await ask_with_cancel(
+                            bot, chat_id, uid,
+                            f"🔐 2FA-пароль для <code>{phone}</code>:",
+                            parse_mode="HTML",
+                        )
+                        if not pwd:
+                            await bot.send_message(uid, f"⏭ Отменено: {phone}")
+                            await client.disconnect()
+                            return False
+                        try:
+                            await client.sign_in(password=pwd.strip())
+                            signed_in = True
+                            break
+                        except Exception:
+                            remaining = 4 - pwd_attempt
+                            if remaining <= 0:
+                                await bot.send_message(uid, f"❌ {phone}: 2FA — попытки исчерпаны.")
+                                await client.disconnect()
+                                return False
+                            await bot.send_message(uid, f"❌ Неверный 2FA-пароль. Осталось: {remaining}.")
+                    break
+                except (PhoneCodeInvalidError, PhoneCodeExpiredError):
+                    remaining = 4 - code_attempt
+                    if remaining <= 0:
+                        await bot.send_message(uid, f"❌ {phone}: код — попытки исчерпаны.")
+                        await client.disconnect()
+                        return False
+                    await bot.send_message(uid, f"❌ Неверный код. Осталось: {remaining}.")
+            if not signed_in:
                 await client.disconnect()
                 return False
 
@@ -910,7 +923,7 @@ async def cb_acc_tdata_local(cb: CallbackQuery):
     await cb.answer()
     _confirmed = False
     try:
-        path_raw = await ask_with_cancel(
+        path_raw = await ask_with_retry(
             bot, cb.message.chat.id, uid,
             "📂 <b>Импорт TData из локальной папки</b>\n\n"
             "Пришлите <b>абсолютный путь</b> к папке, в которой лежат "
@@ -920,6 +933,8 @@ async def cb_acc_tdata_local(cb: CallbackQuery):
             "<code>C:\\Users\\dayhu\\Downloads\\tdata_pack</code>\n\n"
             "Поддерживаются вложенные структуры — все tdata будут найдены "
             "рекурсивно.",
+            validator=lambda p: os.path.isdir(p.strip().strip('"').strip("'")),
+            error_msg="❌ Папка не найдена. Укажите корректный абсолютный путь.",
             parse_mode="HTML",
         )
         if not path_raw:
@@ -927,12 +942,6 @@ async def cb_acc_tdata_local(cb: CallbackQuery):
                                     "Отменено.")
             return
         local_path = path_raw.strip().strip('"').strip("'")
-        if not os.path.isdir(local_path):
-            await bot.send_message(
-                uid, f"❌ Папка не найдена: <code>{local_path}</code>"
-            )
-            await restore_main_menu(bot, cb.message.chat.id, uid)
-            return
 
         # Превью — сколько и какие папки нашли (Q-improvement)
         from tdata_import import (
@@ -1116,13 +1125,15 @@ async def cb_acc_session_local(cb: CallbackQuery):
     await cb.answer()
     _confirmed = False
     try:
-        path_raw = await ask_with_cancel(
+        path_raw = await ask_with_retry(
             bot, cb.message.chat.id, uid,
             "📥 <b>Импорт .session файлов (локальная папка)</b>\n\n"
             "Пришлите абсолютный путь к папке, где лежат "
             "<code>*.session</code> файлы (рекурсивно). Имена файлов "
             "и подпапок — любые.\n\n"
             "Пример: <code>C:\\Users\\dayhu\\Downloads\\sessions_pack</code>",
+            validator=lambda p: os.path.isdir(p.strip().strip('"').strip("'")),
+            error_msg="❌ Папка не найдена. Укажите корректный абсолютный путь.",
             parse_mode="HTML",
         )
         if not path_raw:
@@ -1130,12 +1141,6 @@ async def cb_acc_session_local(cb: CallbackQuery):
                                     "Отменено.")
             return
         local_path = path_raw.strip().strip('"').strip("'")
-        if not os.path.isdir(local_path):
-            await bot.send_message(
-                uid, f"❌ Папка не найдена: <code>{local_path}</code>"
-            )
-            await restore_main_menu(bot, cb.message.chat.id, uid)
-            return
 
         # Превью
         from tdata_import import find_session_files
@@ -1318,12 +1323,14 @@ async def cb_noop(cb: CallbackQuery):
 async def cb_acc_reset_all(cb: CallbackQuery):
     uid = cb.from_user.id
     await cb.answer()
-    confirm = await ask_with_cancel(
+    confirm = await ask_with_retry(
         bot, cb.message.chat.id, uid,
         "⚠️ Удалить ВСЕ сессии и аккаунты? Напишите <b>ДА</b>.",
+        validator=lambda t: t.strip().lower() == "да",
+        error_msg='❌ Напишите именно "ДА".',
         parse_mode="HTML",
     )
-    if not confirm or confirm.strip().lower() != "да":
+    if not confirm:
         return await cb.message.answer("Отменено.")
     accs = await db.db_get_accounts_by_owner(uid)
     n = 0
@@ -1747,10 +1754,16 @@ async def cb_px_list(cb: CallbackQuery):
 async def cb_px_add(cb: CallbackQuery):
     uid = cb.from_user.id
     await cb.answer()
-    raw = await ask_with_cancel(
+    def _has_valid_proxy(text: str) -> bool:
+        return any(parse_proxy_string(l.strip())
+                   for l in text.splitlines() if l.strip())
+
+    raw = await ask_with_retry(
         bot, cb.message.chat.id, uid,
         "🔑 Пришлите прокси (host:port:user:pass).\n"
         "Можно несколько строк.",
+        validator=_has_valid_proxy,
+        error_msg="❌ Не нашёл валидных прокси. Формат: host:port:user:pass",
     )
     if raw is None:
         return
@@ -1907,10 +1920,16 @@ async def cb_gpx_add(cb: CallbackQuery):
     if not await db.db_admins_check(uid):
         return await cb.answer("⛔ Только админ.", show_alert=True)
     await cb.answer()
-    raw = await ask_with_cancel(
+    def _has_valid_proxy_g(text: str) -> bool:
+        return any(parse_proxy_string(l.strip())
+                   for l in text.splitlines() if l.strip())
+
+    raw = await ask_with_retry(
         bot, cb.message.chat.id, uid,
         "🌐 Пришлите глобальные прокси (host:port:user:pass).\n"
         "Можно несколько строк. Дубликаты будут проигнорированы.",
+        validator=_has_valid_proxy_g,
+        error_msg="❌ Не нашёл валидных прокси. Формат: host:port:user:pass",
     )
     if raw is None:
         return
@@ -2079,9 +2098,13 @@ async def _resolve_targets_group(uid: int, gi: int) -> List[Dict[str, Any]]:
 
 async def _resolve_targets_manual(uid: int, chat_id: int
                                   ) -> List[Dict[str, Any]]:
-    raw = await ask_with_cancel(
+    raw = await ask_with_retry(
         bot, chat_id, uid,
-        "📱 Пришлите номера (через запятую или с новой строки):"
+        "📱 Пришлите номера (через запятую или с новой строки):",
+        validator=lambda t: any(
+            validate_phone(tok) for tok in re.split(r"[,\n;\s]+", t) if tok
+        ),
+        error_msg="❌ Не нашёл валидных номеров. Формат: +79991112233",
     )
     if not raw:
         return []
@@ -2293,7 +2316,7 @@ async def cb_ldvr_t(cb: CallbackQuery):
         return await bot.send_message(uid, "❌ Целей нет.")
     store.ldv_data[uid]["targets"] = [a["phone"] for a in targets]
 
-    raw = await ask_with_cancel(
+    raw = await ask_with_retry(
         bot, cb.message.chat.id, uid,
         "📋 Пришлите данные (6 строк через Enter):\n"
         "1. Возраст (можно несколько через запятую)\n"
@@ -2302,14 +2325,12 @@ async def cb_ldvr_t(cb: CallbackQuery):
         "4. Город (можно несколько через запятую)\n"
         "5. Имя (можно несколько через запятую)\n"
         "6. Задержка в минутах перед стартом",
+        validator=lambda t: len([s.strip() for s in t.splitlines() if s.strip()]) >= 6,
+        error_msg="❌ Нужно 6 непустых строк.",
     )
     if not raw:
         return await restore_main_menu(bot, cb.message.chat.id, uid)
     lines = [s.strip() for s in raw.splitlines() if s.strip()]
-    if len(lines) < 6:
-        return await bot.send_message(
-            uid, "❌ Нужно 6 непустых строк."
-        )
     ages   = [s.strip() for s in lines[0].split(",") if s.strip()]
     sex    = lines[1]
     target = lines[2]
@@ -2490,19 +2511,19 @@ async def cb_xor_t(cb: CallbackQuery):
         return await bot.send_message(uid, "❌ Целей нет.")
     store.xo_data[uid]["targets"] = [a["phone"] for a in targets]
 
-    raw = await ask_with_cancel(
+    raw = await ask_with_retry(
         bot, cb.message.chat.id, uid,
         "📋 Пришлите данные (4 строки через Enter):\n"
         "1. Пол: «💁‍♀️ я девушка» или «🙋‍♂️ я парень»\n"
         "2. Дата рождения (дд.мм.гггг)\n"
         "3. Город\n"
         "4. Имя",
+        validator=lambda t: len([s.strip() for s in t.splitlines() if s.strip()]) >= 4,
+        error_msg="❌ Нужно 4 непустых строк.",
     )
     if not raw:
         return await restore_main_menu(bot, cb.message.chat.id, uid)
     lines = [s.strip() for s in raw.splitlines() if s.strip()]
-    if len(lines) < 4:
-        return await bot.send_message(uid, "❌ Нужно 4 непустых строк.")
     store.xo_data[uid].update({
         "sex":      lines[0],
         "birthday": lines[1],
@@ -2897,10 +2918,14 @@ async def cb_mng_xo(cb: CallbackQuery):
 async def cb_mng_manual_ldv(cb: CallbackQuery):
     uid = cb.from_user.id
     await cb.answer()
-    raw = await ask_with_cancel(
+    raw = await ask_with_retry(
         bot, cb.message.chat.id, uid,
         "❤️ Пришлите номера для немедленного пролайка ДВ "
         "(через запятую или с новой строки):",
+        validator=lambda t: any(
+            validate_phone(tok) for tok in re.split(r"[,\n;\s]+", t) if tok
+        ),
+        error_msg="❌ Не нашёл валидных номеров. Формат: +79991112233",
     )
     if not raw:
         return
@@ -2910,15 +2935,61 @@ async def cb_mng_manual_ldv(cb: CallbackQuery):
         if p:
             phones.append(p)
     n = 0
+    not_found = []
     for ph in phones:
         a = await db.db_get_account(ph)
-        if a and a.get("owner_id") == uid:
-            await db.db_schedule_ldv_task(ph, uid, time.time() + 2,
+        if a:
+            owner = a.get("owner_id") or uid
+            await db.db_schedule_ldv_task(ph, owner, time.time() + 2,
                                           step=0, status="pending")
             store.cancelled_phones.discard(ph)
             store.paused_phones.discard(ph)
             n += 1
-    await cb.message.answer(f"✅ Запланировано: {n}.")
+        else:
+            not_found.append(ph)
+    text = f"✅ Запланировано ДВ: {n}."
+    if not_found:
+        text += f"\n⚠️ Не найдены в БД: {', '.join(not_found)}"
+    await cb.message.answer(text)
+
+
+# ── 💘 Ручной пролайк XO ──
+@dp.callback_query(F.data == "mng_manual_xo")
+async def cb_mng_manual_xo(cb: CallbackQuery):
+    uid = cb.from_user.id
+    await cb.answer()
+    raw = await ask_with_retry(
+        bot, cb.message.chat.id, uid,
+        "💘 Пришлите номера для немедленного пролайка XO "
+        "(через запятую или с новой строки):",
+        validator=lambda t: any(
+            validate_phone(tok) for tok in re.split(r"[,\n;\s]+", t) if tok
+        ),
+        error_msg="❌ Не нашёл валидных номеров. Формат: +79991112233",
+    )
+    if not raw:
+        return
+    phones = []
+    for tok in re.split(r"[,\n;\s]+", raw):
+        p = validate_phone(tok)
+        if p:
+            phones.append(p)
+    n = 0
+    not_found = []
+    for ph in phones:
+        a = await db.db_get_account(ph)
+        if a:
+            owner = a.get("owner_id") or uid
+            await db.db_schedule_xo_task(ph, owner, time.time() + 2,
+                                         status="pending")
+            store.xo_liking_paused.discard(ph)
+            n += 1
+        else:
+            not_found.append(ph)
+    text = f"✅ Запланировано XO: {n}."
+    if not_found:
+        text += f"\n⚠️ Не найдены в БД: {', '.join(not_found)}"
+    await cb.message.answer(text)
 
 
 # ── ⚙️ Управление лайкингом ДВ ──
@@ -2943,9 +3014,9 @@ async def cb_back_manage(cb: CallbackQuery):
     await cb.message.edit_text(
         "📊 <b>Управление</b>",
         reply_markup=kb(
-            [("💘 Рега XO", "mng_xo")],
             [("❤️ Ручной пролайк ДВ", "mng_manual_ldv")],
-            [("⚙️ Управление лайкингом", "mng_ldv")],
+            [("💘 Ручной пролайк XO", "mng_manual_xo")],
+            [("⚙️ Управление лайкингом ДВ", "mng_ldv")],
             [("💘 Управление XO", "mng_xo_panel")],
             [("🛑 Отмена регистрации", "mng_regcancel")],
             [home_btn()],
@@ -3042,11 +3113,13 @@ async def cb_mng_ldv_del(cb: CallbackQuery):
 async def cb_mng_ldv_resetall(cb: CallbackQuery):
     uid = cb.from_user.id
     await cb.answer()
-    confirm = await ask_with_cancel(
+    confirm = await ask_with_retry(
         bot, cb.message.chat.id, uid,
         "⚠️ Удалить ВСЕ LDV-задачи? Напишите <b>ДА</b>.",
+        validator=lambda t: t.strip().lower() == "да",
+        error_msg='❌ Напишите именно "ДА".',
     )
-    if not confirm or confirm.strip().lower() != "да":
+    if not confirm:
         return await cb.message.answer("Отменено.")
     tasks = await db.db_get_ldv_tasks_by_owner(uid)
     for t in tasks:
@@ -3089,9 +3162,13 @@ async def cb_mng_ldv_grpdel(cb: CallbackQuery):
 async def cb_mng_ldv_resetman(cb: CallbackQuery):
     uid = cb.from_user.id
     await cb.answer()
-    raw = await ask_with_cancel(
+    raw = await ask_with_retry(
         bot, cb.message.chat.id, uid,
-        "🎯 Пришлите номера для удаления LDV-задач:"
+        "🎯 Пришлите номера для удаления LDV-задач:",
+        validator=lambda t: any(
+            validate_phone(tok) for tok in re.split(r"[,\n;\s]+", t) if tok
+        ),
+        error_msg="❌ Не нашёл валидных номеров. Формат: +79991112233",
     )
     if not raw:
         return
@@ -3298,10 +3375,14 @@ async def cb_rc_ldv_gi(cb: CallbackQuery):
 async def cb_rc_ldv_man(cb: CallbackQuery):
     uid = cb.from_user.id
     await cb.answer()
-    raw = await ask_with_cancel(
+    raw = await ask_with_retry(
         bot, cb.message.chat.id, uid,
         "🛑 Пришлите номера для отмены ЛДВ-регистрации "
         "(через запятую или с новой строки):",
+        validator=lambda t: any(
+            validate_phone(tok) for tok in re.split(r"[,\n;\s]+", t) if tok
+        ),
+        error_msg="❌ Не нашёл валидных номеров. Формат: +79991112233",
     )
     if not raw:
         return
@@ -3378,10 +3459,14 @@ async def cb_rc_xo_gi(cb: CallbackQuery):
 async def cb_rc_xo_man(cb: CallbackQuery):
     uid = cb.from_user.id
     await cb.answer()
-    raw = await ask_with_cancel(
+    raw = await ask_with_retry(
         bot, cb.message.chat.id, uid,
         "🛑 Пришлите номера для отмены XO-регистрации "
         "(через запятую или с новой строки):",
+        validator=lambda t: any(
+            validate_phone(tok) for tok in re.split(r"[,\n;\s]+", t) if tok
+        ),
+        error_msg="❌ Не нашёл валидных номеров. Формат: +79991112233",
     )
     if not raw:
         return
@@ -3443,9 +3528,11 @@ async def cb_adm_wl_add(cb: CallbackQuery):
     if not await db.db_admins_check(cb.from_user.id):
         return await cb.answer("⛔", show_alert=True)
     await cb.answer()
-    raw = await ask_with_cancel(
+    raw = await ask_with_retry(
         bot, cb.message.chat.id, cb.from_user.id,
-        "👤 Пришлите user_id или @username для добавления в whitelist:"
+        "👤 Пришлите user_id или @username для добавления в whitelist:",
+        validator=lambda t: t.strip().startswith("@") or t.strip().lstrip("-").isdigit(),
+        error_msg="❌ Введите числовой user_id или @username.",
     )
     if not raw:
         return
@@ -3478,16 +3565,15 @@ async def cb_adm_wl_del(cb: CallbackQuery):
     if not await db.db_admins_check(cb.from_user.id):
         return await cb.answer("⛔", show_alert=True)
     await cb.answer()
-    raw = await ask_with_cancel(
+    raw = await ask_with_retry(
         bot, cb.message.chat.id, cb.from_user.id,
-        "🗑 Пришлите user_id для удаления из whitelist:"
+        "🗑 Пришлите user_id для удаления из whitelist:",
+        validator=lambda t: t.strip().lstrip("-").isdigit(),
+        error_msg="❌ user_id должен быть числом.",
     )
     if not raw:
         return
-    try:
-        user_id = int(raw.strip())
-    except Exception:
-        return await cb.message.answer("❌ user_id должен быть числом.")
+    user_id = int(raw.strip())
     await db.db_whitelist_remove(user_id)
     await cb.message.answer(f"🗑 Удалён: <code>{user_id}</code>")
 
@@ -3516,16 +3602,15 @@ async def cb_adm_admins_add(cb: CallbackQuery):
     if not await db.db_admins_check(cb.from_user.id):
         return await cb.answer("⛔", show_alert=True)
     await cb.answer()
-    raw = await ask_with_cancel(
+    raw = await ask_with_retry(
         bot, cb.message.chat.id, cb.from_user.id,
-        "👮 user_id нового админа:"
+        "👮 user_id нового админа:",
+        validator=lambda t: t.strip().lstrip("-").isdigit(),
+        error_msg="❌ user_id должен быть числом.",
     )
     if not raw:
         return
-    try:
-        user_id = int(raw.strip())
-    except Exception:
-        return await cb.message.answer("❌ user_id должен быть числом.")
+    user_id = int(raw.strip())
     await db.db_admins_add(user_id)
     await cb.message.answer(f"✅ Админ: <code>{user_id}</code>")
 
@@ -3535,16 +3620,15 @@ async def cb_adm_admins_del(cb: CallbackQuery):
     if not await db.db_admins_check(cb.from_user.id):
         return await cb.answer("⛔", show_alert=True)
     await cb.answer()
-    raw = await ask_with_cancel(
+    raw = await ask_with_retry(
         bot, cb.message.chat.id, cb.from_user.id,
-        "🗑 user_id админа для удаления:"
+        "🗑 user_id админа для удаления:",
+        validator=lambda t: t.strip().lstrip("-").isdigit(),
+        error_msg="❌ user_id должен быть числом.",
     )
     if not raw:
         return
-    try:
-        user_id = int(raw.strip())
-    except Exception:
-        return await cb.message.answer("❌ user_id должен быть числом.")
+    user_id = int(raw.strip())
     await db.db_admins_remove(user_id)
     await cb.message.answer(f"🗑 Админ удалён: <code>{user_id}</code>")
 
@@ -3641,6 +3725,25 @@ async def _on_startup():
     asyncio.create_task(xo_liking_scheduler(store, notify_func=notify_owner))
     # автоответы из БД
     asyncio.create_task(_bootstrap_autoreplies())
+
+    # сторож сессий: удаляет .session-файлы разлогиненных аккаунтов
+    async def _watchdog_notify(phone: str) -> None:
+        """Уведомить владельца аккаунта об удалении сессии."""
+        try:
+            acc = await db.db_get_account(phone)
+            uid = acc["owner_id"] if acc else None
+            if uid:
+                await notify_owner(uid,
+                    f"⚠️ Аккаунт <code>{phone}</code> вышел из системы — "
+                    f"сессия удалена.")
+        except Exception as e:
+            log.debug("watchdog_notify %s: %s", phone, e)
+
+    asyncio.create_task(
+        _session_watchdog(config.SESSIONS_DIR,
+                          interval=120,
+                          notify_func=_watchdog_notify)
+    )
     log.info("Менеджер запущен.")
 
 

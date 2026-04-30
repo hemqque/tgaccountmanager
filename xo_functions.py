@@ -33,12 +33,18 @@ import db
 import client_pool as _client_pool
 from config import (
     API_ID, API_HASH, SESSIONS_DIR, XO_BOT,
-    XO_PREMIUM_PHRASE, XO_PAUSE_SECONDS,
-    XO_LIKE_INTERVAL, XO_CHECK_INTERVAL, XO_CHECK_LAST_N,
+    XO_PREMIUM_PHRASE, XO_MATCH_STOP_PHRASE, XO_MATCH_STOP_PHRASE_EN,
+    XO_PAUSE_SECONDS, XO_LIKE_INTERVAL, XO_CHECK_LAST_N,
 )
 
 # Фразы-маркеры исчерпания лимита (ru + en)
-_XO_LIMIT_PHRASES = [XO_PREMIUM_PHRASE.lower(), "subscription is"]
+_XO_LIMIT_PHRASES = [
+    XO_PREMIUM_PHRASE.lower(),
+    XO_MATCH_STOP_PHRASE.lower(),
+    XO_MATCH_STOP_PHRASE_EN.lower(),
+    "subscription is",
+    "subscribe",
+]
 from global_proxy import proxy_to_telethon, get_proxy_for_account
 from reg_resume import XO_BTNS
 
@@ -91,7 +97,7 @@ async def _xo_listen(client: TelegramClient, peer, timeout: float = 8.0,
     while time.time() - start < timeout:
         if cancel_set and phone and phone in cancel_set:
             return None
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(2.0)
         last = await _xo_get_last_msg(client, peer)
         if last and last.id > initial_id:
             return last
@@ -206,7 +212,7 @@ async def _xo_click_button(client: TelegramClient, peer, target_text: str,
                     log.warning("xo send_message fallback failed: %s", e2)
                     # не возвращаем False — попробуем следующую кнопку
 
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(2.0)
 
     log.warning(
         "xo click TIMEOUT for %r (target_norm=%r). Seen buttons in last %d "
@@ -229,7 +235,7 @@ async def _xo_wait_for_button(client: TelegramClient, peer, target_text: str,
         for _m, b in pairs:
             if _btns_match(target_norm, getattr(b, "text", "") or ""):
                 return True
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(2.0)
     return False
 
 
@@ -256,7 +262,7 @@ async def _xo_wait_for_text(client: TelegramClient, peer, needle: str,
                     getattr(m, "message", None) or "")
             if needle_n in _xo_norm(text):
                 return True
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(2.0)
     return False
 
 
@@ -297,7 +303,7 @@ async def _xo_wait_button_or_text(client: TelegramClient, peer,
                         getattr(m, "message", None) or "")
                 if txt_norm in _xo_norm(text):
                     return "text"
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(2.0)
     return ""
 
 
@@ -334,6 +340,28 @@ async def register_one_xo(client: TelegramClient, phone: str,
         # 1. /start → определить язык по первому ответу
         await client.send_message(bot, "/start")
         await asyncio.sleep(random.uniform(1, 2))
+
+        # ── Проверка: аккаунт уже зарегистрирован? ──────────────
+        try:
+            _pre = await client.get_messages(bot, limit=5)
+            _reg_phrases = [
+                _xo_norm("Даём Telegram Stars за друзей"),   # ru
+                _xo_norm("We give Telegram Stars for friends"),  # en
+            ]
+            for _m in _pre:
+                _t = _xo_norm(
+                    getattr(_m, "text", "") or
+                    getattr(_m, "message", "") or ""
+                )
+                if any(_p in _t for _p in _reg_phrases):
+                    if notify_func:
+                        await notify_func(
+                            f"⏭ {phone}: уже зарегистрирован в XO — "
+                            f"пропускаю.")
+                    return False
+        except Exception:
+            pass
+        # ─────────────────────────────────────────────────────────
 
         first = await _xo_get_last_msg(client, bot)
         text0 = ((first.text if first else "") or "").lower()
@@ -535,7 +563,55 @@ async def xo_liking_task(phone: str, owner_id: int,
                 await asyncio.sleep(60)
                 continue
 
-            last_check = 0.0
+            # ── Предстартовая проверка ──────────────────────────────
+            # Смотрим состояние чата ДО первого ❤️, применяем те же правила
+            try:
+                pre_msgs = await client.get_messages(bot, limit=XO_CHECK_LAST_N)
+                pre_joined = " | ".join(
+                    _xo_norm(
+                        getattr(m, "message", "") or
+                        getattr(m, "text", "") or ""
+                    )
+                    for m in pre_msgs if m
+                )
+                if any(_xo_norm(p) in pre_joined for p in _XO_LIMIT_PHRASES):
+                    until_ts = time.time() + XO_PAUSE_SECONDS
+                    until_str = time.strftime("%d.%m %H:%M",
+                                              time.localtime(until_ts))
+                    await db.db_update_xo_task(
+                        phone, status="paused", next_run=until_ts
+                    )
+                    store.xo_liking_paused.add(phone)
+                    if notify_func:
+                        try:
+                            await notify_func(
+                                owner_id,
+                                f"🛑 {phone}: XO — лимит при старте. "
+                                f"Следующий старт: {until_str}.",
+                            )
+                        except Exception:
+                            pass
+                    wait_until = time.time() + XO_PAUSE_SECONDS
+                    while time.time() < wait_until:
+                        if phone not in store.xo_liking_tasks:
+                            break
+                        await asyncio.sleep(60)
+                    store.xo_liking_paused.discard(phone)
+                    await db.db_update_xo_task(
+                        phone, status="pending", next_run=time.time()
+                    )
+                elif _xo_norm("настрой интересы") in pre_joined:
+                    clicked = await _xo_click_button(
+                        client, bot, "смотреть анкеты", timeout=10,
+                    )
+                    if not clicked:
+                        await client.send_message(bot, "🔎 Смотреть анкеты")
+                    log.info("xo %s: pre-check — нажата 'Смотреть анкеты'",
+                             phone)
+                    await asyncio.sleep(2)
+            except Exception as e:
+                log.warning("xo pre-check %s: %s", phone, e)
+            # ────────────────────────────────────────────────────────
 
             while phone in store.xo_liking_tasks:
                 if phone in store.xo_liking_paused:
@@ -551,48 +627,64 @@ async def xo_liking_task(phone: str, owner_id: int,
                     log.warning("xo like send %s: %s", phone, e)
                     break  # выйти во внешний цикл для переподключения
 
-                now = time.time()
-                if now - last_check >= XO_CHECK_INTERVAL:
-                    last_check = now
-                    try:
-                        msgs = await client.get_messages(
-                            bot, limit=XO_CHECK_LAST_N
+                # Проверяем сообщения после каждого лайка
+                try:
+                    msgs = await client.get_messages(
+                        bot, limit=XO_CHECK_LAST_N
+                    )
+                    # _xo_norm снимает эмодзи и нормализует пробелы —
+                    # это критично для фраз вида "🤚 Чтобы просматривать..."
+                    joined_norm = " | ".join(
+                        _xo_norm(
+                            getattr(m, "message", "") or
+                            getattr(m, "text", "") or ""
                         )
-                        joined = " | ".join(
-                            (m.text or m.message or "").lower()
-                            for m in msgs if m
+                        for m in msgs if m
+                    )
+
+                    # 1. Стоп-фразы → пауза 24ч 10м, затем цикл повторяется
+                    if any(_xo_norm(p) in joined_norm for p in _XO_LIMIT_PHRASES):
+                        until_ts = time.time() + XO_PAUSE_SECONDS
+                        until_str = time.strftime(
+                            "%d.%m %H:%M", time.localtime(until_ts)
                         )
-                        if any(p in joined for p in _XO_LIMIT_PHRASES):
-                            until_ts = time.time() + XO_PAUSE_SECONDS
-                            until_str = time.strftime(
-                                "%d.%m %H:%M", time.localtime(until_ts)
-                            )
-                            await db.db_update_xo_task(
-                                phone, status="paused", next_run=until_ts
-                            )
-                            store.xo_liking_paused.add(phone)
-                            if notify_func:
-                                try:
-                                    await notify_func(
-                                        owner_id,
-                                        f"🛑 {phone}: XO лимит исчерпан. "
-                                        f"Пауза до {until_str}.",
-                                    )
-                                except Exception:
-                                    pass
-                            wait_until = time.time() + XO_PAUSE_SECONDS
-                            while time.time() < wait_until:
-                                if phone not in store.xo_liking_tasks:
-                                    break
-                                await asyncio.sleep(60)
-                            store.xo_liking_paused.discard(phone)
-                            await db.db_update_xo_task(
-                                phone, status="pending",
-                                next_run=time.time(),
-                            )
-                            continue
-                    except Exception as e:
-                        log.warning("xo limit-check %s: %s", phone, e)
+                        await db.db_update_xo_task(
+                            phone, status="paused", next_run=until_ts
+                        )
+                        store.xo_liking_paused.add(phone)
+                        if notify_func:
+                            try:
+                                await notify_func(
+                                    owner_id,
+                                    f"🛑 {phone}: XO — цикл завершён. "
+                                    f"Следующий старт: {until_str}.",
+                                )
+                            except Exception:
+                                pass
+                        wait_until = time.time() + XO_PAUSE_SECONDS
+                        while time.time() < wait_until:
+                            if phone not in store.xo_liking_tasks:
+                                break
+                            await asyncio.sleep(60)
+                        store.xo_liking_paused.discard(phone)
+                        await db.db_update_xo_task(
+                            phone, status="pending",
+                            next_run=time.time(),
+                        )
+                        continue
+
+                    # 2. "настрой интересы" → нажать reply-кнопку "смотреть анкеты"
+                    if _xo_norm("настрой интересы") in joined_norm:
+                        clicked = await _xo_click_button(
+                            client, bot, "смотреть анкеты", timeout=10,
+                        )
+                        if not clicked:
+                            await client.send_message(bot, "🔎 Смотреть анкеты")
+                        log.info("xo %s: нажата кнопка 'Смотреть анкеты'", phone)
+                        await asyncio.sleep(2)
+
+                except Exception as e:
+                    log.warning("xo limit-check %s: %s", phone, e)
 
                 await asyncio.sleep(XO_LIKE_INTERVAL)
 

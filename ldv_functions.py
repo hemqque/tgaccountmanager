@@ -89,6 +89,23 @@ async def register_one_ldv(client: TelegramClient,
     try:
         if _is_cancel(): return False
         await _send("/start");                     await _save(0)
+
+        # ── Проверка: аккаунт уже зарегистрирован? ──────────────
+        try:
+            _pre = await client.get_messages(bot, limit=5)
+            for _m in _pre:
+                _t = (getattr(_m, "text", "") or
+                      getattr(_m, "message", "") or "").lower()
+                if "так выглядит твоя анкета" in _t:
+                    if notify_func:
+                        await notify_func(
+                            f"⏭ {phone}: уже зарегистрирован в LDV — "
+                            f"пропускаю.")
+                    return False
+        except Exception:
+            pass
+        # ─────────────────────────────────────────────────────────
+
         if _is_cancel(): return False
         await _send("🇷🇺 Русский");                await _save(1)
         if _is_cancel(): return False
@@ -224,6 +241,37 @@ async def ldv_liking_task(phone: str, owner_id: int, store,
     ldv_attach_listener(client, phone, store)
     store.current_liking_phones.add(phone)
     await db.db_update_ldv_task(phone, status="running")
+
+    # ── Предстартовая проверка ──────────────────────────────────
+    # Смотрим последнее сообщение от бота; если лимит — откладываем цикл
+    try:
+        pre_msgs = await client.get_messages(LDV_BOT, limit=1)
+        if pre_msgs:
+            pre_text = (
+                getattr(pre_msgs[0], "message", "") or
+                getattr(pre_msgs[0], "text", "") or ""
+            ).lower()
+            if ("лимит" in pre_text or "исчерпан" in pre_text
+                    or "ограничен" in pre_text):
+                pause_min = random.uniform(LDV_LISTEN_LO, LDV_LISTEN_HI)
+                await db.db_update_ldv_task(
+                    phone, status="pending",
+                    next_run=time.time() + pause_min * 60,
+                )
+                if notify_func:
+                    try:
+                        await notify_func(
+                            owner_id,
+                            f"⏸ {phone}: LDV — лимит при старте, "
+                            f"следующий цикл через {pause_min:.1f} мин.",
+                        )
+                    except Exception:
+                        pass
+                store.current_liking_phones.discard(phone)
+                return  # планировщик перезапустит задачу позже
+    except Exception as e:
+        log.warning("ldv pre-check %s: %s", phone, e)
+    # ────────────────────────────────────────────────────────────
 
     try:
         while True:

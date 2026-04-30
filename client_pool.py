@@ -88,3 +88,55 @@ async def remove(phone: str) -> None:
 
 def all_phones() -> list:
     return list(_pool.keys())
+
+
+async def session_watchdog(session_dir: str,
+                           interval: float = 120.0,
+                           notify_func=None) -> None:
+    """
+    Фоновый сторож: каждые `interval` секунд проверяет все клиенты пула.
+    Если клиент разлогинился (is_user_authorized() == False) — удаляет его
+    из пула, отключает и стирает .session-файл(ы) с диска.
+
+    notify_func(phone: str) — опциональный асинхронный/синхронный колбэк.
+    """
+    import glob
+
+    while True:
+        await asyncio.sleep(interval)
+        for phone in list(_pool.keys()):
+            cli = _pool.get(phone)
+            if cli is None:
+                continue
+            try:
+                if not cli.is_connected():
+                    # клиент отвалился — пробуем переподключить
+                    try:
+                        await cli.connect()
+                    except Exception:
+                        pass
+                authorized = await cli.is_user_authorized()
+            except Exception as e:
+                log.debug("watchdog check %s: %s", phone, e)
+                continue
+
+            if not authorized:
+                log.info("watchdog: %s — сессия недействительна, удаляю", phone)
+                await remove(phone)
+
+                # удаляем .session и .session-journal на диске
+                base = os.path.join(session_dir, phone)
+                for path in glob.glob(base + "*"):
+                    try:
+                        os.remove(path)
+                        log.info("watchdog: удалён файл %s", path)
+                    except Exception as e:
+                        log.warning("watchdog: не удалось удалить %s: %s", path, e)
+
+                if notify_func is not None:
+                    try:
+                        result = notify_func(phone)
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception as e:
+                        log.debug("watchdog notify %s: %s", phone, e)

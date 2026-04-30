@@ -167,22 +167,14 @@ _pending_text: Dict[int, asyncio.Future] = {}
 CANCEL_TEXT = "❌ Отмена"
 
 
-def cancel_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=CANCEL_TEXT)]],
-        resize_keyboard=True, one_time_keyboard=True,
-    )
-
-
 async def ask_with_cancel(bot: Bot, chat_id: int, uid: int,
                           prompt: str,
                           timeout: float = ASK_TIMEOUT,
                           parse_mode: Optional[str] = None) -> Optional[str]:
     """
-    Отправить prompt с reply-кнопкой «❌ Отмена», ждать текстовый ответ
-    в течение timeout секунд.
+    Отправить prompt, ждать текстовый ответ в течение timeout секунд.
       • вернёт текст;
-      • если пользователь нажал «❌ Отмена» (или прислал такой текст) → None;
+      • если пользователь прислал «отмена» или подобное → None;
       • если истёк таймаут → None.
     """
     # отменяем висящий запрос для этого uid, если был
@@ -195,7 +187,8 @@ async def ask_with_cancel(bot: Bot, chat_id: int, uid: int,
 
     try:
         await bot.send_message(
-            chat_id, prompt, reply_markup=cancel_keyboard(),
+            chat_id, prompt,
+            reply_markup=ReplyKeyboardRemove(),
             parse_mode=parse_mode,
         )
     except Exception as e:
@@ -219,6 +212,37 @@ async def ask_with_cancel(bot: Bot, chat_id: int, uid: int,
     return text
 
 
+async def ask_with_retry(
+    bot: Bot,
+    chat_id: int,
+    uid: int,
+    prompt: str,
+    validator,
+    error_msg: Optional[str] = None,
+    max_attempts: int = 5,
+    timeout: float = ASK_TIMEOUT,
+    parse_mode: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Повторяет ask_with_cancel до max_attempts раз, пока validator(text) не вернёт True.
+    Возвращает валидный текст или None при отмене/исчерпании попыток.
+    """
+    current_prompt = prompt
+    for attempt in range(max_attempts):
+        raw = await ask_with_cancel(bot, chat_id, uid, current_prompt,
+                                    timeout=timeout, parse_mode=parse_mode)
+        if raw is None:
+            return None
+        if validator(raw):
+            return raw
+        remaining = max_attempts - attempt - 1
+        if remaining <= 0:
+            return None
+        err = error_msg or "❌ Неверный ввод."
+        current_prompt = f"{err} Осталось попыток: {remaining}.\n\n{prompt}"
+    return None
+
+
 def register_pending_text(uid: int, text: str) -> bool:
     """
     Передать текст ожидающему ask_with_cancel(). Возвращает True, если
@@ -236,10 +260,25 @@ def has_pending(uid: int) -> bool:
     return uid in _pending_text
 
 
+def cancel_pending_ask(uid: int) -> None:
+    fut = _pending_text.pop(uid, None)
+    if fut and not fut.done():
+        fut.cancel()
+
+
 # ─────────────────────────────────────────────────────────────────
 # Универсальный аиограмный декоратор отлова текста для ask_with_cancel
 # ─────────────────────────────────────────────────────────────────
-def attach_pending_router(router: Router) -> None:
+
+# Тексты reply-кнопок главного меню — имеют высший приоритет:
+# при их нажатии текущий pending-ввод отменяется, а не поглощается.
+MENU_BUTTON_TEXTS: frozenset = frozenset({
+    "⚙️ аккаунты", "🤖 автоматизация", "📊 управление",
+    "📈 прогресс", "👑 админ", "🏠 главное меню",
+})
+
+
+def attach_pending_router(router: Router, store=None) -> None:
     """
     Главный роутер должен вызвать это, чтобы текстовые ответы пользователя
     автоматически попадали в ожидающие ask_with_cancel.
@@ -251,9 +290,17 @@ def attach_pending_router(router: Router) -> None:
         if not msg.from_user:
             return
         uid = msg.from_user.id
+        text_lower = (msg.text or "").strip().lower()
+
+        # Кнопки главного меню → отменяем pending-ввод и пропускаем
+        # сообщение дальше к хендлерам разделов (не глотаем как ввод)
+        if text_lower in MENU_BUTTON_TEXTS:
+            cancel_pending_ask(uid)
+            if store is not None:
+                store.set_action(uid, None)
+            return
+
         if not has_pending(uid):
             return  # пропустить — пусть обрабатывают другие хендлеры
-        text = msg.text or ""
-        register_pending_text(uid, text)
-        # «съесть» сообщение — НЕ возвращать управление дальше
+        register_pending_text(uid, msg.text or "")
         return
