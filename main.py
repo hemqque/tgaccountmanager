@@ -127,6 +127,10 @@ _bot_username: str = ""
 # Временное хранилище выбранных телефонов для передачи: uid -> List[str]
 _transfer_pending: Dict[int, List[str]] = {}
 
+# Множество выбранных телефонов в интерактивном списке: uid -> set[str]
+_trf_selection: Dict[int, set] = {}
+_TRF_SEL_PER_PAGE = 6
+
 
 # =================================================================
 # ── СЕКЦИЯ: HELPER-ФУНКЦИИ ──
@@ -304,6 +308,8 @@ async def handle_cancel(msg: Message):
     store.reset_user(uid)
     _grp_index_cache.pop(uid, None)
     _signin_sessions.pop(uid, None)
+    _trf_selection.pop(uid, None)
+    _transfer_pending.pop(uid, None)
     await restore_main_menu(bot, msg.chat.id, uid, "✅ Действие отменено.")
 
 
@@ -330,6 +336,8 @@ async def handle_home(msg: Message):
     store.reset_user(uid)
     _grp_index_cache.pop(uid, None)
     _signin_sessions.pop(uid, None)
+    _trf_selection.pop(uid, None)
+    _transfer_pending.pop(uid, None)
     await restore_main_menu(bot, msg.chat.id, uid,
                             "Возврат в главное меню.")
 
@@ -341,6 +349,8 @@ async def cb_action_cancel(cb: CallbackQuery):
     _tdata_sessions.pop(uid, None)
     _signin_sessions.pop(uid, None)
     _grp_index_cache.pop(uid, None)
+    _trf_selection.pop(uid, None)
+    _transfer_pending.pop(uid, None)
     try:
         await cb.message.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -3928,37 +3938,13 @@ async def cb_acc_transfer(cb: CallbackQuery):
     )
 
 
-@dp.callback_query(F.data.startswith("trf_t:"))
-async def cb_trf_t(cb: CallbackQuery):
-    uid = cb.from_user.id
-    parts = cb.data.split(":")
-    mode = parts[1]
-    targets: List[Dict[str, Any]] = []
-    if mode == "all":
-        targets = await _resolve_targets_all(uid)
-        await cb.answer()
-    elif mode == "grp" and len(parts) == 2:
-        await cb.answer()
-        return await _send_groups_picker(uid, cb.message.chat.id, "trf_t")
-    elif mode == "gi":
-        await cb.answer()
-        targets = await _resolve_targets_group(uid, int(parts[2]))
-    elif mode == "man":
-        await cb.answer()
-        targets = await _resolve_targets_manual(uid, cb.message.chat.id)
-    else:
-        return await cb.answer("Bad", show_alert=True)
-
-    if not targets:
-        return await bot.send_message(uid, "❌ Аккаунтов для передачи нет.")
-
-    phones = [a["phone"] for a in targets]
+async def _trf_show_preview(cb: CallbackQuery, uid: int,
+                            phones: List[str]) -> None:
+    """Сохраняет выбор и показывает превью + кнопку создания ссылки."""
     _transfer_pending[uid] = phones
-
     preview = "\n".join(f"  • <code>{ph}</code>" for ph in phones[:20])
     if len(phones) > 20:
         preview += f"\n  …и ещё {len(phones) - 20}"
-
     await bot.send_message(
         cb.message.chat.id,
         f"🔄 <b>Передача аккаунтов</b>\n"
@@ -3971,6 +3957,161 @@ async def cb_trf_t(cb: CallbackQuery):
             [("❌ Отмена", "action_cancel")],
         ),
     )
+
+
+async def _render_trf_selector(cb: CallbackQuery, uid: int,
+                               page: int) -> None:
+    """Рисует интерактивный список аккаунтов с чекбоксами."""
+    accs = await db.db_get_accounts_by_owner(uid)
+    if not accs:
+        await cb.message.answer("❌ У вас нет аккаунтов.")
+        return
+
+    selected = _trf_selection.setdefault(uid, set())
+    total = len(accs)
+    pages = max(1, (total + _TRF_SEL_PER_PAGE - 1) // _TRF_SEL_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    chunk = accs[page * _TRF_SEL_PER_PAGE:(page + 1) * _TRF_SEL_PER_PAGE]
+
+    rows = []
+    for a in chunk:
+        ph = a["phone"]
+        un = f" (@{a['username']})" if a.get("username") else ""
+        grp = f" 📁{a['grp']}" if a.get("grp") else ""
+        icon = "✅" if ph in selected else "⬜"
+        rows.append([(f"{icon} {ph}{un}{grp}", f"trf_tog:{ph}:{page}")])
+
+    nav = []
+    if page > 0:
+        nav.append(("◀️", f"trf_sel:{page - 1}"))
+    nav.append((f"{page + 1}/{pages}", "noop"))
+    if page < pages - 1:
+        nav.append(("▶️", f"trf_sel:{page + 1}"))
+    if nav:
+        rows.append(nav)
+
+    n_sel = len(selected)
+    if n_sel > 0:
+        rows.append([(f"✅ Подтвердить ({n_sel} выбрано)", "trf_sel_confirm")])
+    rows.append([("❌ Отмена", "action_cancel")])
+
+    text = (
+        f"📋 <b>Выбор аккаунтов</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Всего: <b>{total}</b>  ·  Выбрано: <b>{n_sel}</b>  ·  "
+        f"Стр. {page + 1}/{pages}\n\n"
+        f"Нажмите на аккаунт чтобы отметить/снять:"
+    )
+    try:
+        await cb.message.edit_text(text, reply_markup=kb(*rows))
+    except TelegramBadRequest:
+        await cb.message.answer(text, reply_markup=kb(*rows))
+
+
+@dp.callback_query(F.data.startswith("trf_t:"))
+async def cb_trf_t(cb: CallbackQuery):
+    uid = cb.from_user.id
+    parts = cb.data.split(":")
+    mode = parts[1]
+
+    if mode == "man":
+        # Показываем выбор метода: вручную / из списка
+        _trf_selection.pop(uid, None)
+        await cb.answer()
+        try:
+            await cb.message.edit_text(
+                "✏️ <b>Ручной выбор аккаунтов</b>\n\n"
+                "Как хотите выбрать?",
+                reply_markup=kb(
+                    [("✏️ Ввести номера", "trf_man_type")],
+                    [("📋 Выбрать из списка", "trf_sel:0")],
+                    [("❌ Отмена", "action_cancel")],
+                ),
+            )
+        except TelegramBadRequest:
+            await cb.message.answer(
+                "✏️ <b>Ручной выбор аккаунтов</b>\n\nКак хотите выбрать?",
+                reply_markup=kb(
+                    [("✏️ Ввести номера", "trf_man_type")],
+                    [("📋 Выбрать из списка", "trf_sel:0")],
+                    [("❌ Отмена", "action_cancel")],
+                ),
+            )
+        return
+
+    targets: List[Dict[str, Any]] = []
+    if mode == "all":
+        targets = await _resolve_targets_all(uid)
+        await cb.answer()
+    elif mode == "grp" and len(parts) == 2:
+        await cb.answer()
+        return await _send_groups_picker(uid, cb.message.chat.id, "trf_t")
+    elif mode == "gi":
+        await cb.answer()
+        targets = await _resolve_targets_group(uid, int(parts[2]))
+    else:
+        return await cb.answer("Bad", show_alert=True)
+
+    if not targets:
+        return await bot.send_message(uid, "❌ Аккаунтов для передачи нет.")
+    await _trf_show_preview(cb, uid, [a["phone"] for a in targets])
+
+
+@dp.callback_query(F.data == "trf_man_type")
+async def cb_trf_man_type(cb: CallbackQuery):
+    """Ввод номеров вручную текстом."""
+    uid = cb.from_user.id
+    await cb.answer()
+    targets = await _resolve_targets_manual(uid, cb.message.chat.id)
+    if not targets:
+        return await bot.send_message(uid, "❌ Аккаунтов не найдено.")
+    await _trf_show_preview(cb, uid, [a["phone"] for a in targets])
+
+
+@dp.callback_query(F.data.startswith("trf_sel:"))
+async def cb_trf_sel(cb: CallbackQuery):
+    """Переход между страницами списка."""
+    uid = cb.from_user.id
+    try:
+        page = int(cb.data.split(":", 1)[1])
+    except Exception:
+        page = 0
+    await cb.answer()
+    await _render_trf_selector(cb, uid, page)
+
+
+@dp.callback_query(F.data.startswith("trf_tog:"))
+async def cb_trf_tog(cb: CallbackQuery):
+    """Переключить галочку у аккаунта."""
+    uid = cb.from_user.id
+    parts = cb.data.split(":")
+    # формат: trf_tog:{phone}:{page}  (phone может содержать '+', но не ':')
+    phone = parts[1]
+    try:
+        page = int(parts[2])
+    except Exception:
+        page = 0
+
+    selected = _trf_selection.setdefault(uid, set())
+    if phone in selected:
+        selected.discard(phone)
+    else:
+        selected.add(phone)
+
+    await cb.answer()
+    await _render_trf_selector(cb, uid, page)
+
+
+@dp.callback_query(F.data == "trf_sel_confirm")
+async def cb_trf_sel_confirm(cb: CallbackQuery):
+    """Подтвердить выбор из списка."""
+    uid = cb.from_user.id
+    selected = _trf_selection.pop(uid, set())
+    if not selected:
+        return await cb.answer("Не выбрано ни одного аккаунта.",
+                               show_alert=True)
+    await cb.answer()
+    await _trf_show_preview(cb, uid, sorted(selected))
 
 
 @dp.callback_query(F.data == "trf_create")
