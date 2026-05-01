@@ -9,6 +9,7 @@ import asyncio
 import glob as _glob
 import logging
 import os
+import random
 import re
 import shutil
 import time
@@ -24,7 +25,9 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     PhoneCodeExpiredError,
 )
-from telethon.tl.functions.account import UpdateProfileRequest, UpdateUsernameRequest
+from telethon.tl.functions.account import (
+    UpdateProfileRequest, UpdateUsernameRequest, GetPasswordRequest,
+)
 from telethon.tl.functions.photos import (
     UploadProfilePhotoRequest, DeletePhotosRequest, GetUserPhotosRequest,
 )
@@ -43,6 +46,7 @@ import db
 from bot_globals import (
     bot, store, task_queue, ar_manager,
     _signin_sessions, _tdata_sessions,
+    _man_sel_ctx, _man_selection,
     kb, home_btn, notify_owner, get_or_create_account_client, user_log,
 )
 from utils import (
@@ -59,12 +63,19 @@ from global_proxy import (
 import client_pool as _client_pool
 from account_setup import setup_account
 from progress import _start_progress, _update_progress, _finish_progress
+from handlers.helpers import (
+    _send_target_picker, _send_groups_picker,
+    _resolve_targets_all, _resolve_targets_group, _resolve_targets_manual,
+)
 
 log = logging.getLogger("accounts")
 router = Router(name="accounts")
 
 # Флаги отмены пакетного добавления: uid -> bool
 _batch_cancel: Dict[int, bool] = {}
+
+# Данные массовой смены 2FA: uid -> {targets, cur_pwd, new_pwd}
+_2fa_pending: Dict[int, Dict] = {}
 
 
 # =================================================================
@@ -830,7 +841,7 @@ async def _render_account_card(phone: str, owner_id: int):
     rows = [
         [("Имя", f"acc_name:{phone}"), ("Био", f"acc_bio:{phone}"), ("Username", f"acc_uname:{phone}")],
         [("Фото", f"acc_photo:{phone}"), ("Заметка", f"acc_note:{phone}"), ("Группа", f"acc_grp:{phone}")],
-        [("Приватность", f"acc_priv:{phone}"), ("Получить код", f"acc_code:{phone}")],
+        [("🔑 2FA", f"acc_2fa:{phone}"), ("Приватность", f"acc_priv:{phone}"), ("Получить код", f"acc_code:{phone}")],
         [("Удалить аккаунт", f"acc_del:{phone}")],
         [("< Назад", "acc_list:0"), home_btn()],
     ]
@@ -1102,6 +1113,181 @@ async def cb_acc_del2(cb: CallbackQuery):
             pass
     await cb.answer("Удалён.")
     await cb.message.edit_text(f"{phone} удалён.")
+
+
+# =================================================================
+# СМЕНА 2FA
+# =================================================================
+
+@router.callback_query(F.data.startswith("acc_2fa:"))
+async def cb_acc_2fa(cb: CallbackQuery):
+    """Смена/установка 2FA для одного аккаунта (из карточки)."""
+    phone = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    await cb.answer()
+
+    cli = await get_or_create_account_client(phone, uid)
+    if not cli:
+        return await cb.message.answer("❌ Не удалось подключиться к аккаунту.")
+
+    try:
+        pwd_info = await cli(GetPasswordRequest())
+        has_pwd = pwd_info.has_password
+    except Exception as e:
+        return await cb.message.answer(f"❌ Ошибка получения статуса 2FA: {e}")
+
+    status_text = "🔒 <b>Защищён</b> (2FA включена)" if has_pwd else "🔓 <b>Не защищён</b> (2FA отсутствует)"
+    await cb.message.answer(
+        f"🔑 <b>Смена 2FA</b>  <code>{phone}</code>\n"
+        f"Статус: {status_text}"
+    )
+
+    cur_pwd = None
+    if has_pwd:
+        cur_pwd = await ask_with_cancel(
+            bot, cb.message.chat.id, uid,
+            f"Введите <b>текущий</b> пароль 2FA для <code>{phone}</code>:",
+            parse_mode="HTML",
+        )
+        if cur_pwd is None:
+            return await cb.message.answer("Отменено.")
+
+    new_pwd = await ask_with_cancel(
+        bot, cb.message.chat.id, uid,
+        f"Введите <b>новый</b> пароль 2FA для <code>{phone}</code>:",
+        parse_mode="HTML",
+    )
+    if not new_pwd or not new_pwd.strip():
+        return await cb.message.answer("Отменено.")
+
+    try:
+        kwargs: Dict = {"new_password": new_pwd.strip()}
+        if cur_pwd:
+            kwargs["current_password"] = cur_pwd.strip()
+        await cli.edit_2fa(**kwargs)
+        action = "изменён" if has_pwd else "установлен"
+        await cb.message.answer(f"✅ 2FA для <code>{phone}</code> успешно {action}.")
+    except Exception as e:
+        await cb.message.answer(f"❌ Ошибка: {e}")
+
+
+@router.callback_query(F.data == "acc_2fa_bulk")
+async def cb_acc_2fa_bulk(cb: CallbackQuery):
+    """Массовая смена 2FA — выбор аккаунтов через пикер."""
+    uid = cb.from_user.id
+    if store.is_busy(uid):
+        return await cb.answer("⏳ Завершите текущее действие.", show_alert=True)
+    await cb.answer()
+    await _send_target_picker(
+        cb.message.chat.id, "fa2_t",
+        "🔑 <b>Смена 2FA</b>\n\n"
+        "Выберите аккаунты для установки / смены пароля\n"
+        "двухфакторной аутентификации.\n\n"
+        "⚠️ Для аккаунтов с уже установленной 2FA потребуется текущий пароль."
+    )
+
+
+@router.callback_query(F.data.startswith("fa2_t:"))
+async def cb_fa2_t(cb: CallbackQuery):
+    uid = cb.from_user.id
+    parts = cb.data.split(":")
+    mode = parts[1]
+    if mode == "man":
+        _man_sel_ctx[uid] = "fa2_t"
+        _man_selection.pop(uid, None)
+        await cb.answer()
+        text = "✏️ <b>Ручной выбор аккаунтов</b>\n\nКак хотите выбрать?"
+        markup = kb(
+            [("✏️ Ввести номера", "man_type")],
+            [("📋 Выбрать из списка", "man_sel:0")],
+            [("❌ Отмена", "action_cancel")],
+        )
+        try:
+            await cb.message.edit_text(text, reply_markup=markup)
+        except TelegramBadRequest:
+            await cb.message.answer(text, reply_markup=markup)
+        return
+    targets = []
+    if mode == "all":
+        targets = await _resolve_targets_all(uid)
+        await cb.answer()
+    elif mode == "grp" and len(parts) == 2:
+        await cb.answer()
+        return await _send_groups_picker(uid, cb.message.chat.id, "fa2_t")
+    elif mode == "gi":
+        await cb.answer()
+        targets = await _resolve_targets_group(uid, int(parts[2]))
+    else:
+        return await cb.answer("Bad", show_alert=True)
+    if not targets:
+        return await bot.send_message(uid, "❌ Аккаунтов нет.")
+    await _fa2_after_targets(cb, uid, targets)
+
+
+async def _fa2_after_targets(cb, uid: int, targets) -> None:
+    """Запрашивает пароли и запускает массовую смену 2FA."""
+    if not targets:
+        return await bot.send_message(uid, "❌ Аккаунтов нет.")
+
+    phones = [a["phone"] for a in targets]
+    chat_id = cb.message.chat.id
+
+    cur_raw = await ask_with_cancel(
+        bot, chat_id, uid,
+        f"🔑 <b>Смена 2FA</b>  ·  Целей: <b>{len(phones)}</b>\n\n"
+        "Введите <b>текущий</b> пароль 2FA.\n"
+        "Если 2FA не установлена — введите <code>нет</code>.\n"
+        "(Аккаунты без 2FA пропустят этот шаг автоматически)",
+        parse_mode="HTML",
+    )
+    if cur_raw is None:
+        return await restore_main_menu(bot, chat_id, uid, "Отменено.")
+    cur_pwd: Optional[str] = (
+        None if cur_raw.strip().lower() in ("нет", "no", "none", "-", "")
+        else cur_raw.strip()
+    )
+
+    new_pwd = await ask_with_cancel(
+        bot, chat_id, uid,
+        "🔑 Введите <b>новый</b> пароль 2FA\n"
+        "(будет установлен на все выбранные аккаунты):",
+        parse_mode="HTML",
+    )
+    if not new_pwd or not new_pwd.strip():
+        return await restore_main_menu(bot, chat_id, uid, "Отменено.")
+    new_pwd = new_pwd.strip()
+
+    async def _runner():
+        await _start_progress(bot, chat_id, uid, total=len(phones),
+                               store=store, title="🔑 Смена 2FA")
+        ok = 0
+        for ph in phones:
+            await _update_progress(bot, uid, store, current=ph)
+            try:
+                cli = await get_or_create_account_client(ph, uid)
+                if not cli:
+                    raise RuntimeError("connect failed")
+                try:
+                    pwd_info = await cli(GetPasswordRequest())
+                    has_pwd = pwd_info.has_password
+                except Exception:
+                    has_pwd = False
+                kwargs: Dict = {"new_password": new_pwd}
+                if has_pwd and cur_pwd:
+                    kwargs["current_password"] = cur_pwd
+                await cli.edit_2fa(**kwargs)
+                ok += 1
+                await _update_progress(bot, uid, store, done_inc=1, current=None)
+            except Exception as e:
+                await _update_progress(bot, uid, store, done_inc=1,
+                                       current=None, error=f"{ph}: {e}")
+            await asyncio.sleep(random.uniform(3, 8))
+        await _finish_progress(bot, uid, store,
+                               summary_extra=f"2FA обновлена: {ok}/{len(phones)}")
+        await restore_main_menu(bot, chat_id, uid)
+
+    await task_queue.submit(_runner, owner_id=uid, notify=notify_owner,
+                            title=f"Смена 2FA {len(phones)}")
 
 
 # =================================================================

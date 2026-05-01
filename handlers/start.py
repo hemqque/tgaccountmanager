@@ -144,6 +144,8 @@ async def handle_section_accounts(msg: Message):
             [("📱 Мои аккаунты", "acc_list:0"),
              ("🔑 Мои прокси", "px_list")],
             [("📡 Применить глобальные прокси", "acc_apply_global")],
+            [("🏷 Смена username", "auto_rtag"),
+             ("🔑 Смена 2FA", "acc_2fa_bulk")],
             [("🔄 Передать аккаунты", "acc_transfer")],
             [home_btn()],
         ),
@@ -171,7 +173,6 @@ async def handle_section_auto(msg: Message):
         "регистрация в приложениях, автоответы.",
         reply_markup=kb(
             [("🚀 Массовый залив", "auto_mass")],
-            [("🏷 Смена тега (username)", "auto_rtag")],
             [("🤖 Регистрация LDV", "auto_ldv"),
              ("💘 Регистрация XO", "auto_xo")],
             [("📺 Подписка @leoday", "auto_subdv")],

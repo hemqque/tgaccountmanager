@@ -167,6 +167,9 @@ async def _man_after_confirm(cb, uid: int, phones) -> None:
         await _subdv_after_targets(cb, uid, targets)
     elif ctx == "rtag_t":
         await _rtag_after_targets(cb, uid, targets)
+    elif ctx == "fa2_t":
+        from handlers.accounts import _fa2_after_targets
+        await _fa2_after_targets(cb, uid, targets)
     else:
         await bot.send_message(uid, "❌ Контекст выбора потерян.")
 
