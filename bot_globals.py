@@ -57,7 +57,8 @@ _bot_username: str = ""
 
 # Передача аккаунтов
 _transfer_pending: Dict[int, List[str]] = {}   # uid -> список телефонов
-_trf_selection: Dict[int, set] = {}            # uid -> выбранные телефоны
+_trf_selection: Dict[int, set] = {}            # uid -> выбранные телефоны (ручной выбор)
+_trf_grp_selection: Dict[int, set] = {}        # uid -> выбранные группы (мультивыбор групп)
 _TRF_SEL_PER_PAGE: int = 6
 
 # Универсальный ручной выборщик аккаунтов

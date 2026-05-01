@@ -17,12 +17,13 @@ import bot_globals as _bg
 from bot_globals import (
     bot, store, ar_manager,
     _trf_selection, _transfer_pending, _TRF_SEL_PER_PAGE,
+    _trf_grp_selection, _grp_index_cache,
     notify_owner, kb, home_btn,
 )
 from utils import restore_main_menu
 from handlers.helpers import (
-    _send_target_picker, _send_groups_picker,
-    _resolve_targets_all, _resolve_targets_group, _resolve_targets_manual,
+    _send_target_picker,
+    _resolve_targets_all, _resolve_targets_manual,
 )
 
 log = logging.getLogger("transfer")
@@ -100,6 +101,53 @@ async def _render_trf_selector(cb: CallbackQuery, uid: int, page: int) -> None:
         await cb.message.answer(text, reply_markup=kb(*rows))
 
 
+async def _render_trf_grp_selector(cb: CallbackQuery, uid: int) -> None:
+    """Отображает список групп с чекбоксами для мультивыбора (передача аккаунтов)."""
+    groups = await db.db_get_groups_by_owner(uid)
+    if not groups:
+        text = "📁 <b>У вас нет групп.</b>\nСначала создайте группы для аккаунтов."
+        try:
+            await cb.message.edit_text(text, reply_markup=kb([home_btn()]))
+        except TelegramBadRequest:
+            await bot.send_message(cb.message.chat.id, text,
+                                   reply_markup=kb([home_btn()]))
+        return
+
+    # Обновляем кэш групп
+    _grp_index_cache[uid] = groups
+    selected = _trf_grp_selection.setdefault(uid, set())
+    n_grp = len(groups)
+    n_sel = len(selected)
+    rows = []
+
+    # Кнопка «Выбрать все» / «Снять все»
+    all_selected = n_sel == n_grp
+    rows.append([(
+        "☑️ Снять все группы" if all_selected else "✅ Выбрать все группы",
+        "trf_grp_all"
+    )])
+
+    # Строка на каждую группу
+    for i, g in enumerate(groups):
+        icon = "✅" if g in selected else "⬜"
+        rows.append([(f"{icon} 📁 {g}", f"trf_grp_tog:{i}")])
+
+    # Кнопка подтверждения (только если что-то выбрано)
+    if n_sel > 0:
+        rows.append([(f"🔄 Передать ({n_sel} гр.)", "trf_grp_confirm")])
+    rows.append([("❌ Отмена", "action_cancel")])
+
+    text = (
+        f"📁 <b>Выбор групп для передачи</b>\n━━━━━━━━━━━━━━━━━━━\n"
+        f"Групп всего: <b>{n_grp}</b>  ·  Выбрано: <b>{n_sel}</b>\n\n"
+        f"Отметьте группы — все аккаунты из них войдут в одну ссылку передачи:"
+    )
+    try:
+        await cb.message.edit_text(text, reply_markup=kb(*rows))
+    except TelegramBadRequest:
+        await bot.send_message(cb.message.chat.id, text, reply_markup=kb(*rows))
+
+
 @router.callback_query(F.data.startswith("trf_t:"))
 async def cb_trf_t(cb: CallbackQuery):
     uid = cb.from_user.id
@@ -121,20 +169,82 @@ async def cb_trf_t(cb: CallbackQuery):
                                 [("📋 Выбрать из списка", "trf_sel:0")],
                                 [("❌ Отмена", "action_cancel")]))
         return
-    targets = []
     if mode == "all":
+        await cb.answer()
         targets = await _resolve_targets_all(uid)
+        if not targets:
+            return await bot.send_message(cb.message.chat.id,
+                                          "❌ Аккаунтов для передачи нет.")
+        await _trf_show_preview(cb, uid, [a["phone"] for a in targets])
+    elif mode == "grp":
         await cb.answer()
-    elif mode == "grp" and len(parts) == 2:
-        await cb.answer()
-        return await _send_groups_picker(uid, cb.message.chat.id, "trf_t")
-    elif mode == "gi":
-        await cb.answer()
-        targets = await _resolve_targets_group(uid, int(parts[2]))
+        _trf_grp_selection.pop(uid, None)   # сброс предыдущего выбора групп
+        await _render_trf_grp_selector(cb, uid)
     else:
+        await cb.answer("Bad", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("trf_grp_tog:"))
+async def cb_trf_grp_tog(cb: CallbackQuery):
+    """Переключает выбор одной группы (чекбокс)."""
+    uid = cb.from_user.id
+    try:
+        gi = int(cb.data.split(":", 1)[1])
+    except Exception:
         return await cb.answer("Bad", show_alert=True)
+    groups = _grp_index_cache.get(uid, [])
+    if not (0 <= gi < len(groups)):
+        return await cb.answer("Группа не найдена.", show_alert=True)
+    grp = groups[gi]
+    selected = _trf_grp_selection.setdefault(uid, set())
+    if grp in selected:
+        selected.discard(grp)
+    else:
+        selected.add(grp)
+    await cb.answer()
+    await _render_trf_grp_selector(cb, uid)
+
+
+@router.callback_query(F.data == "trf_grp_all")
+async def cb_trf_grp_all(cb: CallbackQuery):
+    """Выбирает все группы / снимает все."""
+    uid = cb.from_user.id
+    groups = _grp_index_cache.get(uid, [])
+    if not groups:
+        return await cb.answer("Нет групп.", show_alert=True)
+    selected = _trf_grp_selection.setdefault(uid, set())
+    if len(selected) == len(groups):
+        selected.clear()          # снять все
+    else:
+        selected.update(groups)   # выбрать все
+    await cb.answer()
+    await _render_trf_grp_selector(cb, uid)
+
+
+@router.callback_query(F.data == "trf_grp_confirm")
+async def cb_trf_grp_confirm(cb: CallbackQuery):
+    """Подтверждает выбор групп — собирает все аккаунты и показывает превью."""
+    uid = cb.from_user.id
+    selected_groups = _trf_grp_selection.pop(uid, set())
+    if not selected_groups:
+        return await cb.answer("Не выбрано ни одной группы.", show_alert=True)
+    await cb.answer()
+
+    # Собираем аккаунты из всех выбранных групп, убираем дубли
+    phones_seen: set = set()
+    targets = []
+    for grp in sorted(selected_groups):
+        for acc in await db.db_get_accounts_by_group(uid, grp):
+            if acc["phone"] not in phones_seen:
+                phones_seen.add(acc["phone"])
+                targets.append(acc)
+
     if not targets:
-        return await bot.send_message(uid, "❌ Аккаунтов для передачи нет.")
+        return await bot.send_message(
+            cb.message.chat.id,
+            "❌ В выбранных группах нет аккаунтов."
+        )
+    targets.sort(key=lambda a: a["phone"])
     await _trf_show_preview(cb, uid, [a["phone"] for a in targets])
 
 
