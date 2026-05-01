@@ -31,7 +31,9 @@ async def _conn():
     Async context manager для подключения к БД.
     Гарантирует busy_timeout и Row factory для всех запросов.
     """
-    async with _conn() as db:
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("PRAGMA busy_timeout=5000")
         yield db
 
 

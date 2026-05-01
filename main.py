@@ -80,6 +80,7 @@ from global_proxy import (
 from ldv_functions import (
     register_one_ldv, ldv_liking_task, ldv_scheduler, ldv_attach_listener,
 )
+import client_pool as _client_pool
 from client_pool import session_watchdog as _session_watchdog
 from xo_functions import (
     register_one_xo, xo_liking_task, xo_liking_scheduler,
@@ -114,8 +115,6 @@ task_queue = TaskQueue(max_concurrent=config.MAX_CONCURRENT_TASKS)
 
 # Менеджер автоответов
 ar_manager = AutoreplyManager()
-
-import client_pool as _client_pool
 
 # Сессии добавления аккаунта (ввод кода/пароля): uid -> dict
 _signin_sessions: Dict[int, Dict[str, Any]] = {}
@@ -3210,20 +3209,10 @@ async def cb_mng_xo_panel(cb: CallbackQuery):
     await cb.answer()
 
 
-@dp.callback_query(F.data.startswith("mng_ldv_list:"))
-async def cb_mng_ldv_list(cb: CallbackQuery):
+async def _render_ldv_list(cb: CallbackQuery, page: int = 0) -> None:
+    """Отрисовывает список LDV-задач. Не вызывает cb.answer()."""
     uid = cb.from_user.id
-    try:
-        page = int(cb.data.split(":", 1)[1])
-    except Exception:
-        page = 0
     tasks = await db.db_get_ldv_tasks_by_owner(uid)
-    per = 8
-    total = len(tasks)
-    pages = max(1, (total + per - 1) // per)
-    page = max(0, min(page, pages - 1))
-    chunk = tasks[page * per:(page + 1) * per]
-
     if not tasks:
         await cb.message.edit_text(
             "📋 <b>LDV-циклы</b>\n"
@@ -3231,7 +3220,13 @@ async def cb_mng_ldv_list(cb: CallbackQuery):
             "Активных циклов нет.",
             reply_markup=kb([("‹ Назад", "mng_ldv")]),
         )
-        return await cb.answer()
+        return
+
+    per = 8
+    total = len(tasks)
+    pages = max(1, (total + per - 1) // per)
+    page = max(0, min(page, pages - 1))
+    chunk = tasks[page * per:(page + 1) * per]
 
     n_run  = sum(1 for t in tasks if t["phone"] in store.current_liking_phones)
     n_paus = sum(1 for t in tasks if t["phone"] in store.paused_phones)
@@ -3248,7 +3243,8 @@ async def cb_mng_ldv_list(cb: CallbackQuery):
         nxt = time.strftime("%d.%m %H:%M",
                             time.localtime(t["next_run"] or 0))
         is_paused = ph in store.paused_phones
-        running_icon = "▶️" if ph in store.current_liking_phones else ("⏸" if is_paused else "⏳")
+        running_icon = ("▶️" if ph in store.current_liking_phones
+                        else ("⏸" if is_paused else "⏳"))
         lines.append(
             f"{running_icon} {ph} — {st}  /  next: {nxt}  /  шаг {t['step']}"
         )
@@ -3267,6 +3263,15 @@ async def cb_mng_ldv_list(cb: CallbackQuery):
         rows.append(nav)
     rows.append([("‹ Назад", "mng_ldv")])
     await cb.message.edit_text("\n".join(lines), reply_markup=kb(*rows))
+
+
+@dp.callback_query(F.data.startswith("mng_ldv_list:"))
+async def cb_mng_ldv_list(cb: CallbackQuery):
+    try:
+        page = int(cb.data.split(":", 1)[1])
+    except Exception:
+        page = 0
+    await _render_ldv_list(cb, page)
     await cb.answer()
 
 
@@ -3279,8 +3284,7 @@ async def cb_mng_ldv_pp(cb: CallbackQuery):
     else:
         store.paused_phones.add(ph)
         await cb.answer("⏸ На паузе.")
-    cb.data = "mng_ldv_list:0"
-    await cb_mng_ldv_list(cb)
+    await _render_ldv_list(cb, page=0)
 
 
 @dp.callback_query(F.data.startswith("mng_ldv_del:"))
@@ -3289,8 +3293,7 @@ async def cb_mng_ldv_del(cb: CallbackQuery):
     store.cancelled_phones.add(ph)
     await db.db_delete_ldv_task(ph)
     await cb.answer("🗑 Задача удалена.")
-    cb.data = "mng_ldv_list:0"
-    await cb_mng_ldv_list(cb)
+    await _render_ldv_list(cb, page=0)
 
 
 @dp.callback_query(F.data == "mng_ldv_resetall")
@@ -3505,7 +3508,7 @@ async def cb_rc_clear(cb: CallbackQuery):
     store.ldv_reg_cancel.clear()
     store.xo_reg_cancel.clear()
     await cb.answer(f"Очищено: {n}", show_alert=True)
-    cb.data = "mng_regcancel"
+    # cb_mng_regcancel не использует cb.data — вызываем напрямую
     await cb_mng_regcancel(cb)
 
 
@@ -3928,7 +3931,7 @@ async def _notify_admins(text: str) -> None:
             try:
                 await bot.send_message(uid, text)
             except Exception as e:
-                log.debug("notify_admins(%s): %s", uid, e)
+                log.warning("notify_admins(%s): %s", uid, e)
 
 
 async def _on_startup():
