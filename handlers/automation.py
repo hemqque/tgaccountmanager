@@ -183,7 +183,9 @@ async def cb_auto_mass(cb: CallbackQuery):
     await cb.answer()
     await _send_target_picker(
         cb.message.chat.id, "mass_t",
-        "🚀 <b>Массовый залив</b>\n\nМассово обновит выбранные параметры профиля для выбранных аккаунтов."
+        "🚀 <b>Массовый залив</b>\n\n"
+        "Выберите аккаунты — затем отметите что именно менять:\n"
+        "✏️ Имена  ·  📝 Био  ·  📷 Фото"
     )
 
 
