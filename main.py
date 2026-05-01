@@ -17,6 +17,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import shutil
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -119,6 +120,12 @@ ar_manager = AutoreplyManager()
 # Сессии добавления аккаунта (ввод кода/пароля): uid -> dict
 _signin_sessions: Dict[int, Dict[str, Any]] = {}
 _batch_cancel: Dict[int, bool] = {}
+
+# Юзернейм бота (заполняется при старте, нужен для генерации ссылок)
+_bot_username: str = ""
+
+# Временное хранилище выбранных телефонов для передачи: uid -> List[str]
+_transfer_pending: Dict[int, List[str]] = {}
 
 
 # =================================================================
@@ -266,6 +273,14 @@ async def _callback_guard_mw(handler, event: CallbackQuery, data):
 @dp.message(CommandStart())
 async def handle_start(msg: Message):
     uid = msg.from_user.id
+
+    # ── Deep-link: передача аккаунтов ──
+    parts = (msg.text or "").split(maxsplit=1)
+    args = parts[1].strip() if len(parts) > 1 else ""
+    if args.startswith("tr_"):
+        await _handle_transfer_incoming(msg, uid, args[3:])
+        return
+
     is_admin = await db.db_admins_check(uid)
     name = msg.from_user.first_name or "друг"
     text = (
@@ -353,6 +368,7 @@ async def handle_section_accounts(msg: Message):
             [("📱 Мои аккаунты", "acc_list:0"),
              ("🔑 Мои прокси", "px_list")],
             [("📡 Применить глобальные прокси", "acc_apply_global")],
+            [("🔄 Передать аккаунты", "acc_transfer")],
             [home_btn()],
         ),
     )
@@ -3890,6 +3906,260 @@ async def cb_adm_all_accs(cb: CallbackQuery):
 
 
 # =================================================================
+# ── СЕКЦИЯ: 🔄 ПЕРЕДАЧА АККАУНТОВ ──
+# =================================================================
+
+@dp.callback_query(F.data == "acc_transfer")
+async def cb_acc_transfer(cb: CallbackQuery):
+    uid = cb.from_user.id
+    accs = await db.db_get_accounts_by_owner(uid)
+    if not accs:
+        return await cb.answer("У вас нет аккаунтов для передачи.",
+                               show_alert=True)
+    await cb.answer()
+    await _send_target_picker(
+        cb.message.chat.id, "trf_t",
+        "🔄 <b>Передача аккаунтов</b>\n\n"
+        "Выберите аккаунты, которые хотите передать другому пользователю.\n\n"
+        "⚠️ При передаче:\n"
+        "  • Группа и личный прокси очистятся\n"
+        "  • Все задачи LDV/XO/автоответы сбросятся\n"
+        "  • Вы получите уведомление когда получатель примет",
+    )
+
+
+@dp.callback_query(F.data.startswith("trf_t:"))
+async def cb_trf_t(cb: CallbackQuery):
+    uid = cb.from_user.id
+    parts = cb.data.split(":")
+    mode = parts[1]
+    targets: List[Dict[str, Any]] = []
+    if mode == "all":
+        targets = await _resolve_targets_all(uid)
+        await cb.answer()
+    elif mode == "grp" and len(parts) == 2:
+        await cb.answer()
+        return await _send_groups_picker(uid, cb.message.chat.id, "trf_t")
+    elif mode == "gi":
+        await cb.answer()
+        targets = await _resolve_targets_group(uid, int(parts[2]))
+    elif mode == "man":
+        await cb.answer()
+        targets = await _resolve_targets_manual(uid, cb.message.chat.id)
+    else:
+        return await cb.answer("Bad", show_alert=True)
+
+    if not targets:
+        return await bot.send_message(uid, "❌ Аккаунтов для передачи нет.")
+
+    phones = [a["phone"] for a in targets]
+    _transfer_pending[uid] = phones
+
+    preview = "\n".join(f"  • <code>{ph}</code>" for ph in phones[:20])
+    if len(phones) > 20:
+        preview += f"\n  …и ещё {len(phones) - 20}"
+
+    await bot.send_message(
+        cb.message.chat.id,
+        f"🔄 <b>Передача аккаунтов</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Выбрано: <b>{len(phones)}</b>\n\n"
+        f"{preview}\n\n"
+        f"Создать одноразовую ссылку передачи?",
+        reply_markup=kb(
+            [("🔗 Создать ссылку", "trf_create")],
+            [("❌ Отмена", "action_cancel")],
+        ),
+    )
+
+
+@dp.callback_query(F.data == "trf_create")
+async def cb_trf_create(cb: CallbackQuery):
+    uid = cb.from_user.id
+    phones = _transfer_pending.pop(uid, None)
+    if not phones:
+        return await cb.answer("Сессия передачи устарела — начните заново.",
+                               show_alert=True)
+
+    token = secrets.token_urlsafe(16)
+    await db.db_transfer_create(token, uid, phones)
+
+    bot_un = _bot_username or "бот"
+    link = f"https://t.me/{bot_un}?start=tr_{token}"
+    await cb.answer()
+    try:
+        await cb.message.edit_text(
+            f"🔗 <b>Ссылка передачи создана</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"Аккаунтов: <b>{len(phones)}</b>\n\n"
+            f"Отправьте получателю эту ссылку:\n"
+            f"<code>{link}</code>\n\n"
+            f"⚠️ Ссылка <b>одноразовая</b> — после принятия сгорает.\n"
+            f"Если получатель откажется — аккаунты остаются у вас.",
+            reply_markup=kb([home_btn()]),
+        )
+    except Exception:
+        await cb.message.answer(
+            f"🔗 <b>Ссылка передачи:</b>\n<code>{link}</code>",
+            reply_markup=kb([home_btn()]),
+        )
+
+
+async def _handle_transfer_incoming(msg: Message, uid: int,
+                                    token: str) -> None:
+    """
+    Вызывается когда получатель переходит по ссылке t.me/БОТ?start=tr_TOKEN.
+    Показывает превью и кнопки «Принять» / «Отклонить».
+    """
+    rec = await db.db_transfer_get(token)
+    if not rec:
+        await msg.answer(
+            "❌ Ссылка передачи недействительна или уже использована."
+        )
+        await restore_main_menu(bot, msg.chat.id, uid)
+        return
+
+    from_uid = rec["from_uid"]
+    phones: List[str] = rec["phones"]
+
+    if from_uid == uid:
+        await msg.answer("⚠️ Нельзя передать аккаунты самому себе.")
+        await restore_main_menu(bot, msg.chat.id, uid)
+        return
+
+    # Проверяем, какие аккаунты ещё принадлежат отправителю
+    valid: List[str] = []
+    for ph in phones:
+        a = await db.db_get_account(ph)
+        if a and a.get("owner_id") == from_uid:
+            valid.append(ph)
+
+    if not valid:
+        await db.db_transfer_delete(token)
+        await msg.answer(
+            "❌ Все аккаунты из этой ссылки уже недоступны\n"
+            "(удалены или ранее переданы)."
+        )
+        await restore_main_menu(bot, msg.chat.id, uid)
+        return
+
+    preview = "\n".join(f"  • <code>{ph}</code>" for ph in valid[:20])
+    if len(valid) > 20:
+        preview += f"\n  …и ещё {len(valid) - 20}"
+
+    await msg.answer(
+        f"📦 <b>Вам предлагают аккаунты</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Количество: <b>{len(valid)}</b>\n\n"
+        f"{preview}\n\n"
+        f"⚠️ Все задачи LDV/XO/автоответы будут сброшены.\n"
+        f"Принять передачу?",
+        reply_markup=kb(
+            [("✅ Принять", f"trf_accept:{token}")],
+            [("❌ Отклонить", f"trf_decline:{token}")],
+        ),
+    )
+
+
+@dp.callback_query(F.data.startswith("trf_accept:"))
+async def cb_trf_accept(cb: CallbackQuery):
+    token = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+
+    rec = await db.db_transfer_get(token)
+    if not rec:
+        await cb.answer("❌ Ссылка уже использована.", show_alert=True)
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    from_uid: int = rec["from_uid"]
+    phones: List[str] = rec["phones"]
+
+    # Одноразовый токен — удаляем немедленно, чтобы исключить двойное нажатие
+    await db.db_transfer_delete(token)
+    await cb.answer("⏳ Принимаю аккаунты…")
+
+    ok: List[str] = []
+    skipped: List[str] = []
+
+    for ph in phones:
+        a = await db.db_get_account(ph)
+        if not a or a.get("owner_id") != from_uid:
+            skipped.append(ph)  # удалён или уже передан другому
+            continue
+
+        # ── Останавливаем все активные процессы ──
+        try:
+            await ar_manager.stop(ph)
+        except Exception:
+            pass
+        xo_task = store.xo_liking_tasks.pop(ph, None)
+        if xo_task and not xo_task.done():
+            xo_task.cancel()
+        # Сигнализируем LDV-задаче остановиться
+        store.cancelled_phones.add(ph)
+        store.paused_phones.discard(ph)
+
+        # ── Передаём (меняет owner_id, чистит grp/proxy, удаляет задачи) ──
+        await db.db_transfer_account(ph, uid)
+        ok.append(ph)
+
+    # Для аккаунтов без активного LDV-лупа чистим cancelled_phones сами
+    for ph in ok:
+        if ph not in store.current_liking_phones:
+            store.cancelled_phones.discard(ph)
+
+    # ── Ответ получателю ──
+    ok_text = "\n".join(f"  ✅ <code>{ph}</code>" for ph in ok)
+    skip_text = "\n".join(f"  ❌ <code>{ph}</code>" for ph in skipped)
+    result_text = (
+        f"📦 <b>Передача завершена</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Принято: <b>{len(ok)}</b>"
+    )
+    if ok_text:
+        result_text += f"\n{ok_text}"
+    if skipped:
+        result_text += (
+            f"\n\nНедоступных (удалены/уже переданы): <b>{len(skipped)}</b>\n"
+            f"{skip_text}"
+        )
+    try:
+        await cb.message.edit_text(result_text, reply_markup=None)
+    except Exception:
+        await cb.message.answer(result_text)
+    await restore_main_menu(bot, cb.message.chat.id, uid)
+
+    # ── Уведомляем отправителя ──
+    try:
+        notif = (
+            f"📦 <b>Передача принята</b>\n"
+            f"Пользователь <code>{uid}</code> принял "
+            f"<b>{len(ok)}</b> аккаунт(ов)."
+        )
+        if skipped:
+            notif += f"\n⚠️ Недоступных: {len(skipped)}"
+        await notify_owner(from_uid, notif)
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("trf_decline:"))
+async def cb_trf_decline(cb: CallbackQuery):
+    token = cb.data.split(":", 1)[1]
+    await db.db_transfer_delete(token)
+    await cb.answer("Передача отклонена.")
+    try:
+        await cb.message.edit_text("❌ Передача аккаунтов отклонена.")
+    except Exception:
+        pass
+    await restore_main_menu(bot, cb.message.chat.id, cb.from_user.id)
+
+
+# =================================================================
 # ── СЕКЦИЯ: BOOTSTRAP ──
 # =================================================================
 async def _bootstrap_autoreplies():
@@ -3935,8 +4205,14 @@ async def _notify_admins(text: str) -> None:
 
 
 async def _on_startup():
+    global _bot_username
     await _bootstrap_dirs()
     await db.init_db()
+    try:
+        me = await bot.get_me()
+        _bot_username = me.username or ""
+    except Exception as e:
+        log.warning("_on_startup: get_me() failed: %s", e)
     # уведомлятель для AutoreplyManager
     ar_manager.set_notifier(notify_owner)
     # уведомлятель для health-check глобал-прокси (alive→dead)

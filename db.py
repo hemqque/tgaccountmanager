@@ -122,6 +122,13 @@ async def init_db() -> None:
                 added_at   REAL
             );
 
+            CREATE TABLE IF NOT EXISTS transfer_tokens(
+                token       TEXT PRIMARY KEY,
+                from_uid    INTEGER NOT NULL,
+                phones_json TEXT NOT NULL,
+                created_at  REAL NOT NULL
+            );
+
             -- Индексы для горячих запросов (планировщики проверяют каждые 10 сек)
             CREATE INDEX IF NOT EXISTS idx_ldv_pending
                 ON ldv_tasks(status, next_run);
@@ -133,6 +140,8 @@ async def init_db() -> None:
                 ON accounts(owner_id, grp);
             CREATE INDEX IF NOT EXISTS idx_ar_owner
                 ON autoreply_settings(owner_id);
+            CREATE INDEX IF NOT EXISTS idx_transfer_from
+                ON transfer_tokens(from_uid);
             """
         )
         # Загрузить начальных админов
@@ -714,3 +723,77 @@ async def db_gproxy_delete(proxy_id: int) -> None:
     async with _conn() as db:
         await db.execute("DELETE FROM global_proxies WHERE id=?", (proxy_id,))
         await db.commit()
+
+
+# =================================================================
+# ── TRANSFER TOKENS (передача аккаунтов по ссылке) ───────────────
+# =================================================================
+
+async def db_transfer_create(token: str, from_uid: int,
+                             phones: List[str]) -> None:
+    """Сохраняет одноразовый токен передачи с набором телефонов."""
+    async with _conn() as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO transfer_tokens"
+            "(token, from_uid, phones_json, created_at) VALUES (?,?,?,?)",
+            (token, from_uid,
+             json.dumps(phones, ensure_ascii=False), time.time()),
+        )
+        await db.commit()
+
+
+async def db_transfer_get(token: str) -> Optional[Dict[str, Any]]:
+    """Возвращает запись токена (с полем phones: List[str]) или None."""
+    async with _conn() as db:
+        cur = await db.execute(
+            "SELECT * FROM transfer_tokens WHERE token=?", (token,)
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["phones"] = json.loads(d.get("phones_json") or "[]")
+        except Exception:
+            d["phones"] = []
+        return d
+
+
+async def db_transfer_delete(token: str) -> None:
+    """Удаляет токен (после использования или отмены)."""
+    async with _conn() as db:
+        await db.execute(
+            "DELETE FROM transfer_tokens WHERE token=?", (token,)
+        )
+        await db.commit()
+
+
+async def db_transfer_account(phone: str, new_owner_id: int) -> None:
+    """
+    Передаёт аккаунт новому владельцу:
+      • меняет owner_id
+      • очищает grp и proxy (пользовательский прокси сбрасывается;
+        если был пустым — аккаунт продолжает работать через глобальный пул)
+      • удаляет задачи LDV/XO и настройки автоответа старого владельца
+    """
+    async with _conn() as db:
+        await db.execute(
+            "UPDATE accounts SET owner_id=?, grp='', proxy='' WHERE phone=?",
+            (new_owner_id, phone),
+        )
+        await db.execute("DELETE FROM ldv_tasks WHERE phone=?", (phone,))
+        await db.execute("DELETE FROM xo_tasks WHERE phone=?", (phone,))
+        await db.execute(
+            "DELETE FROM autoreply_settings WHERE phone=?", (phone,)
+        )
+        await db.commit()
+
+
+async def db_transfer_delete_by_owner(from_uid: int) -> int:
+    """Удаляет все токены, созданные владельцем (при удалении аккаунта)."""
+    async with _conn() as db:
+        cur = await db.execute(
+            "DELETE FROM transfer_tokens WHERE from_uid=?", (from_uid,)
+        )
+        await db.commit()
+        return cur.rowcount or 0
