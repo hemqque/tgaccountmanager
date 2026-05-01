@@ -1,4 +1,4 @@
-# Telegram Bot Manager (ферма аккаунтов)
+# Telegram Bot Manager (ферма аккаунтов) (жертва вайбкодинга)
 
 Бот-менеджер на **aiogram 3.x** + множество юзерботов на **Telethon**,
 SQLite через **aiosqlite**, SOCKS5-прокси через **python-socks**.
