@@ -25,10 +25,10 @@ import logging
 from typing import Optional, List, Dict
 
 from aiogram import Bot, Router
+from aiogram.filters import BaseFilter, Command   # noqa: F401  (re-export-friendly)
 from aiogram.types import (
     Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
 )
-from aiogram.filters import Command   # noqa: F401  (re-export-friendly)
 
 import db
 from config import AUTO_JOIN_CHANNELS, ASK_TIMEOUT, INITIAL_ADMIN_IDS
@@ -285,29 +285,42 @@ MENU_BUTTON_TEXTS: frozenset = frozenset({
 })
 
 
+class _PendingInputFilter(BaseFilter):
+    """
+    Срабатывает только когда у пользователя есть активный ask_with_cancel.
+    Кнопки главного меню — не глотаем: отменяем pending и возвращаем False,
+    чтобы сообщение дошло до хендлеров разделов.
+    """
+    def __init__(self, store_ref=None):
+        self._store = store_ref
+
+    async def __call__(self, message: Message) -> bool:
+        if not message.from_user:
+            return False
+        uid = message.from_user.id
+        if not has_pending(uid):
+            return False
+        text_lower = (message.text or "").strip().lower()
+        if text_lower in MENU_BUTTON_TEXTS:
+            # Отменяем pending-ввод, но НЕ глотаем сообщение —
+            # пусть хендлер раздела обработает нажатие кнопки меню.
+            cancel_pending_ask(uid)
+            if self._store is not None:
+                self._store.set_action(uid, None)
+            return False
+        return True
+
+
 def attach_pending_router(router: Router, store=None) -> None:
     """
     Главный роутер должен вызвать это, чтобы текстовые ответы пользователя
     автоматически попадали в ожидающие ask_with_cancel.
-    Регистрирует обработчик ВЫСОКОГО приоритета — поэтому добавляйте
-    этот router ПЕРВЫМ к диспетчеру.
+    Используем фильтр _PendingInputFilter — хендлер срабатывает ТОЛЬКО
+    когда есть активный диалог, иначе сообщение идёт дальше без перехвата.
     """
-    @router.message()
-    async def _catch_all(msg: Message):
-        if not msg.from_user:
-            return
+    filt = _PendingInputFilter(store_ref=store)
+
+    @router.message(filt)
+    async def _catch_pending(msg: Message):
         uid = msg.from_user.id
-        text_lower = (msg.text or "").strip().lower()
-
-        # Кнопки главного меню → отменяем pending-ввод и пропускаем
-        # сообщение дальше к хендлерам разделов (не глотаем как ввод)
-        if text_lower in MENU_BUTTON_TEXTS:
-            cancel_pending_ask(uid)
-            if store is not None:
-                store.set_action(uid, None)
-            return
-
-        if not has_pending(uid):
-            return  # пропустить — пусть обрабатывают другие хендлеры
         register_pending_text(uid, msg.text or "")
-        return

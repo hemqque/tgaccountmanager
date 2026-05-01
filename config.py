@@ -86,6 +86,14 @@ PROXY_HEALTH_CHECK_INTERVAL = 600   # каждые 10 минут
 # Таймаут TCP-соединения для проверки SOCKS5 (секунд)
 PROXY_CHECK_TIMEOUT = 8
 
+# ───────────────────────── Прокси для бота ──────────────────────
+# Прокси для самого бота (aiogram HTTP-сессия).
+# Поддерживаются HTTP и SOCKS5 форматы:
+#   http://user:pass@host:port
+#   socks5://user:pass@host:port
+# Оставьте пустым, если прокси не нужен.
+BOT_PROXY = os.getenv("BOT_PROXY", "")
+
 # ───────────────────────── Прочее ───────────────────────────────
 # Папка с .session-файлами Telethon
 SESSIONS_DIR = "sessions"

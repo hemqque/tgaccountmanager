@@ -11,7 +11,11 @@ sessions/
 *.session
 *.session-journal
 
-# Временные файлы
+# TData папки (могут содержать ключи аккаунтов)
+tdata/
+*.tdata
+
+# Временные файлы загрузок
 temp/
 __pycache__/
 *.pyc
@@ -22,7 +26,11 @@ __pycache__/
 # Логи
 *.log
 
-# IDE
+# IDE / инструменты
 .idea/
 .vscode/
 *.swp
+.claude/
+
+# Скрипт запуска (содержит локальные пути)
+script.ps1

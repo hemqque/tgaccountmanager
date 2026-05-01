@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from telethon import TelegramClient
 
@@ -24,8 +25,19 @@ from global_proxy import proxy_to_telethon, get_proxy_for_account
 log = logging.getLogger("main")
 
 # ─── Основные объекты ────────────────────────────────────────────────
+# Если BOT_PROXY задан в .env — используем его для HTTP-сессии aiogram.
+# Поддерживаются http:// и socks5:// (для socks5 нужен пакет aiohttp-socks).
+_bot_session: Optional[AiohttpSession] = None
+if config.BOT_PROXY:
+    try:
+        _bot_session = AiohttpSession(proxy=config.BOT_PROXY)
+        log.info("Bot session proxy: %s", config.BOT_PROXY)
+    except Exception as _e:
+        log.warning("Failed to create bot proxy session: %s", _e)
+
 bot = Bot(
     token=config.BOT_TOKEN,
+    session=_bot_session,  # None → дефолтная сессия без прокси
     default=DefaultBotProperties(parse_mode="HTML"),
 )
 dp = Dispatcher()
