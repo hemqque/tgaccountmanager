@@ -512,6 +512,11 @@ async def cb_ldvr_photodone(cb: CallbackQuery):
                         owner_id=uid, cancel_set=store.ldv_reg_cancel)
                 if ok:
                     success.append(ph)
+                    # Отправляем город в Saved Messages аккаунта
+                    try:
+                        await cli.send_message("me", per_acc["city"])
+                    except Exception as _e:
+                        log.debug("saved_messages city %s: %s", ph, _e)
                 await _update_progress(bot, uid, store, done_inc=1, current=None,
                                        error=None if ok else f"{ph}: не зарегистрирован")
             except Exception as e:
