@@ -743,7 +743,9 @@ async def db_transfer_create(token: str, from_uid: int,
 
 
 async def db_transfer_get(token: str) -> Optional[Dict[str, Any]]:
-    """Возвращает запись токена (с полем phones: List[str]) или None."""
+    """Возвращает запись токена (с полем phones: List[str]) или None.
+    Автоматически удаляет токен если он истёк (TTL из config.TRANSFER_TOKEN_TTL)."""
+    from config import TRANSFER_TOKEN_TTL
     async with _conn() as db:
         cur = await db.execute(
             "SELECT * FROM transfer_tokens WHERE token=?", (token,)
@@ -752,11 +754,28 @@ async def db_transfer_get(token: str) -> Optional[Dict[str, Any]]:
         if not row:
             return None
         d = dict(row)
+        # Проверяем срок жизни токена
+        if time.time() - (d.get("created_at") or 0) > TRANSFER_TOKEN_TTL:
+            await db.execute("DELETE FROM transfer_tokens WHERE token=?", (token,))
+            await db.commit()
+            return None
         try:
             d["phones"] = json.loads(d.get("phones_json") or "[]")
         except Exception:
             d["phones"] = []
         return d
+
+
+async def db_transfer_cleanup_expired() -> int:
+    """Удаляет все истёкшие токены передачи. Возвращает количество удалённых."""
+    from config import TRANSFER_TOKEN_TTL
+    async with _conn() as db:
+        cur = await db.execute(
+            "DELETE FROM transfer_tokens WHERE created_at < ?",
+            (time.time() - TRANSFER_TOKEN_TTL,),
+        )
+        await db.commit()
+        return cur.rowcount or 0
 
 
 async def db_transfer_delete(token: str) -> None:

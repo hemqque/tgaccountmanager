@@ -78,6 +78,12 @@ _batch_cancel: Dict[int, bool] = {}
 _2fa_pending: Dict[int, Dict] = {}
 
 
+async def _own(phone: str, uid: int) -> bool:
+    """True если аккаунт phone принадлежит uid. Используется для проверки прав."""
+    a = await db.db_get_account(phone)
+    return bool(a and a.get("owner_id") == uid)
+
+
 # =================================================================
 # ДОБАВЛЕНИЕ АККАУНТОВ
 # =================================================================
@@ -93,6 +99,7 @@ async def cb_acc_add(cb: CallbackQuery):
         return any(validate_phone(t.strip())
                    for t in re.split(r"[,\n;]+", text) if t.strip())
 
+    task_submitted = False
     try:
         raw = await ask_with_retry(
             bot, cb.message.chat.id, uid,
@@ -117,45 +124,53 @@ async def cb_acc_add(cb: CallbackQuery):
         cancel_msg = await bot.send_message(
             cb.message.chat.id,
             f"Добавление аккаунтов. В очереди: {len(phones)} номеров",
-            reply_markup=kb([[("Прервать добавление", "acc_add_cancel")]]),
+            reply_markup=kb([("Прервать добавление", "acc_add_cancel")]),
         )
 
         async def _run_add():
-            await _start_progress(bot, cb.message.chat.id, uid,
-                                  total=len(phones), store=store,
-                                  title="Добавление аккаунтов")
-            ok_count = 0
-            for ph in phones:
-                if _batch_cancel.get(uid):
-                    break
-                await _update_progress(bot, uid, store, current=ph)
-                try:
-                    res = await _add_one_account(uid, cb.message.chat.id, ph)
-                    if res:
-                        ok_count += 1
-                    await _update_progress(bot, uid, store, done_inc=1,
-                                           current=None,
-                                           error=None if res else f"{ph}: не добавлен")
-                except Exception as e:
-                    await _update_progress(bot, uid, store, done_inc=1,
-                                           current=None, error=f"{ph}: {e}")
-            was_cancelled = bool(_batch_cancel.get(uid))
-            _batch_cancel.pop(uid, None)
             try:
-                await cancel_msg.delete()
-            except Exception:
-                pass
-            cancelled_note = " (отменено)" if was_cancelled else ""
-            await _finish_progress(bot, uid, store,
-                                   summary_extra=f"Добавлено: {ok_count}/{len(phones)}{cancelled_note}")
-            await restore_main_menu(bot, cb.message.chat.id, uid)
+                await _start_progress(bot, cb.message.chat.id, uid,
+                                      total=len(phones), store=store,
+                                      title="Добавление аккаунтов")
+                ok_count = 0
+                for ph in phones:
+                    if _batch_cancel.get(uid):
+                        break
+                    await _update_progress(bot, uid, store, current=ph)
+                    try:
+                        res = await _add_one_account(uid, cb.message.chat.id, ph)
+                        if res:
+                            ok_count += 1
+                        await _update_progress(bot, uid, store, done_inc=1,
+                                               current=None,
+                                               error=None if res else f"{ph}: не добавлен")
+                    except Exception as e:
+                        await _update_progress(bot, uid, store, done_inc=1,
+                                               current=None, error=f"{ph}: {e}")
+                was_cancelled = bool(_batch_cancel.get(uid))
+                _batch_cancel.pop(uid, None)
+                try:
+                    await cancel_msg.delete()
+                except Exception:
+                    pass
+                cancelled_note = " (отменено)" if was_cancelled else ""
+                await _finish_progress(bot, uid, store,
+                                       summary_extra=f"Добавлено: {ok_count}/{len(phones)}{cancelled_note}")
+                await restore_main_menu(bot, cb.message.chat.id, uid)
+            finally:
+                # Сбрасываем action только когда задача реально завершилась
+                store.set_action(uid, None)
 
         await task_queue.submit(
             _run_add, owner_id=uid, notify=notify_owner,
             title=f"Добавление {len(phones)} аккаунтов",
         )
+        task_submitted = True
     finally:
-        store.set_action(uid, None)
+        # Сбрасываем action только если задача не была отправлена в очередь
+        # (т.е. произошла ошибка до submit). Иначе action сбросит сам _run_add.
+        if not task_submitted:
+            store.set_action(uid, None)
 
 
 async def _add_one_account(uid: int, chat_id: int, phone: str) -> bool:
@@ -168,7 +183,7 @@ async def _add_one_account(uid: int, chat_id: int, phone: str) -> bool:
         parse_mode="HTML",
     )
     if proxy_raw is None:
-        await bot.send_message(uid, f"Пропущено: {phone}")
+        await bot.send_message(chat_id, f"Пропущено: {phone}")
         return False
     if proxy_raw.strip().lower() in ("нет", "no", "none", "-", "без прокси"):
         g = await get_sticky_global_proxy(phone)
@@ -865,6 +880,8 @@ async def cb_acc_card(cb: CallbackQuery):
 async def cb_acc_note(cb: CallbackQuery):
     phone = cb.data.split(":", 1)[1]
     uid = cb.from_user.id
+    if not await _own(phone, uid):
+        return await cb.answer("Аккаунт не найден.", show_alert=True)
     await cb.answer()
     text = await ask_with_cancel(bot, cb.message.chat.id, uid, f"Новая заметка для {phone}:")
     if text is None:
@@ -877,6 +894,8 @@ async def cb_acc_note(cb: CallbackQuery):
 async def cb_acc_grp(cb: CallbackQuery):
     phone = cb.data.split(":", 1)[1]
     uid = cb.from_user.id
+    if not await _own(phone, uid):
+        return await cb.answer("Аккаунт не найден.", show_alert=True)
     await cb.answer()
     groups = (await db.db_get_groups_by_owner(uid))[:8]
     rows = [[(f"{g}", f"acc_grpset2:{phone}:{g}")] for g in groups]
@@ -919,6 +938,8 @@ async def cb_acc_grpnew2(cb: CallbackQuery):
 async def cb_acc_name(cb: CallbackQuery):
     phone = cb.data.split(":", 1)[1]
     uid = cb.from_user.id
+    if not await _own(phone, uid):
+        return await cb.answer("Аккаунт не найден.", show_alert=True)
     await cb.answer()
     new_name = await ask_with_cancel(bot, cb.message.chat.id, uid, f"Новое имя для {phone}:")
     if not new_name:
@@ -937,6 +958,8 @@ async def cb_acc_name(cb: CallbackQuery):
 async def cb_acc_bio(cb: CallbackQuery):
     phone = cb.data.split(":", 1)[1]
     uid = cb.from_user.id
+    if not await _own(phone, uid):
+        return await cb.answer("Аккаунт не найден.", show_alert=True)
     await cb.answer()
     bio = await ask_with_cancel(bot, cb.message.chat.id, uid, f"Новое био для {phone} (до 70 симв.):")
     if bio is None:
@@ -955,6 +978,8 @@ async def cb_acc_bio(cb: CallbackQuery):
 async def cb_acc_photo(cb: CallbackQuery):
     phone = cb.data.split(":", 1)[1]
     uid = cb.from_user.id
+    if not await _own(phone, uid):
+        return await cb.answer("Аккаунт не найден.", show_alert=True)
     await cb.answer()
     store.photo_collecting[uid] = True
     store.clear_temp_photos(uid)
@@ -999,6 +1024,8 @@ async def cb_acc_photodone(cb: CallbackQuery):
 async def cb_acc_uname(cb: CallbackQuery):
     phone = cb.data.split(":", 1)[1]
     uid = cb.from_user.id
+    if not await _own(phone, uid):
+        return await cb.answer("Аккаунт не найден.", show_alert=True)
     await cb.answer()
     new_un = await ask_with_cancel(bot, cb.message.chat.id, uid, f"Новый username для {phone} (без @):")
     if not new_un:
@@ -1018,6 +1045,8 @@ async def cb_acc_uname(cb: CallbackQuery):
 @router.callback_query(F.data.startswith("acc_priv:"))
 async def cb_acc_priv(cb: CallbackQuery):
     phone = cb.data.split(":", 1)[1]
+    if not await _own(phone, cb.from_user.id):
+        return await cb.answer("Аккаунт не найден.", show_alert=True)
     await cb.answer()
     await cb.message.answer(
         f"Приватность для {phone}\nНастройте видимость профиля.",
@@ -1034,6 +1063,8 @@ async def cb_acc_privset(cb: CallbackQuery):
     parts = cb.data.split(":", 2)
     phone, mode = parts[1], parts[2]
     uid = cb.from_user.id
+    if not await _own(phone, uid):
+        return await cb.answer("Аккаунт не найден.", show_alert=True)
     cli = await get_or_create_account_client(phone, uid)
     if not cli:
         return await cb.answer("Не подключились.", show_alert=True)
@@ -1057,6 +1088,8 @@ async def cb_acc_privset(cb: CallbackQuery):
 async def cb_acc_code(cb: CallbackQuery):
     phone = cb.data.split(":", 1)[1]
     uid = cb.from_user.id
+    if not await _own(phone, uid):
+        return await cb.answer("Аккаунт не найден.", show_alert=True)
     cli = await get_or_create_account_client(phone, uid)
     if not cli:
         return await cb.answer("Не подключились.", show_alert=True)
@@ -1082,6 +1115,8 @@ async def cb_acc_code(cb: CallbackQuery):
 @router.callback_query(F.data.startswith("acc_del:"))
 async def cb_acc_del(cb: CallbackQuery):
     phone = cb.data.split(":", 1)[1]
+    if not await _own(phone, cb.from_user.id):
+        return await cb.answer("Аккаунт не найден.", show_alert=True)
     await cb.answer()
     await cb.message.answer(
         f"Удалить аккаунт {phone}?\n\nБудут удалены: .session-файл, задачи LDV и XO, настройки автоответа",
@@ -1095,6 +1130,9 @@ async def cb_acc_del(cb: CallbackQuery):
 @router.callback_query(F.data.startswith("acc_del2:"))
 async def cb_acc_del2(cb: CallbackQuery):
     phone = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    if not await _own(phone, uid):
+        return await cb.answer("Аккаунт не найден.", show_alert=True)
     try:
         await ar_manager.stop(phone)
     except Exception:
@@ -1124,6 +1162,8 @@ async def cb_acc_2fa(cb: CallbackQuery):
     """Смена/установка 2FA для одного аккаунта (из карточки)."""
     phone = cb.data.split(":", 1)[1]
     uid = cb.from_user.id
+    if not await _own(phone, uid):
+        return await cb.answer("Аккаунт не найден.", show_alert=True)
     await cb.answer()
 
     cli = await get_or_create_account_client(phone, uid)

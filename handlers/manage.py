@@ -183,6 +183,10 @@ async def cb_mng_ldv_list(cb: CallbackQuery):
 @router.callback_query(F.data.startswith("mng_ldv_pp:"))
 async def cb_mng_ldv_pp(cb: CallbackQuery):
     ph = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    tasks = await db.db_get_ldv_tasks_by_owner(uid)
+    if not any(t["phone"] == ph for t in tasks):
+        return await cb.answer("Задача не найдена.", show_alert=True)
     if ph in store.paused_phones:
         store.paused_phones.discard(ph)
         await cb.answer("▶️ Возобновлён.")
@@ -195,6 +199,10 @@ async def cb_mng_ldv_pp(cb: CallbackQuery):
 @router.callback_query(F.data.startswith("mng_ldv_del:"))
 async def cb_mng_ldv_del(cb: CallbackQuery):
     ph = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    tasks = await db.db_get_ldv_tasks_by_owner(uid)
+    if not any(t["phone"] == ph for t in tasks):
+        return await cb.answer("Задача не найдена.", show_alert=True)
     store.cancelled_phones.add(ph)
     await db.db_delete_ldv_task(ph)
     await cb.answer("🗑 Задача удалена.")
@@ -316,6 +324,10 @@ async def _xo_manage_render(chat_id: int, uid: int, edit_msg=None):
 @router.callback_query(F.data.startswith("mng_xo_pp:"))
 async def cb_mng_xo_pp(cb: CallbackQuery):
     ph = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    tasks = await db.db_get_xo_tasks_by_owner(uid)
+    if not any(t["phone"] == ph for t in tasks):
+        return await cb.answer("Задача не найдена.", show_alert=True)
     if ph in store.xo_liking_paused:
         store.xo_liking_paused.discard(ph)
         await db.db_update_xo_task(ph, status="running")
@@ -330,6 +342,10 @@ async def cb_mng_xo_pp(cb: CallbackQuery):
 @router.callback_query(F.data.startswith("mng_xo_stop:"))
 async def cb_mng_xo_stop(cb: CallbackQuery):
     ph = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    tasks = await db.db_get_xo_tasks_by_owner(uid)
+    if not any(t["phone"] == ph for t in tasks):
+        return await cb.answer("Задача не найдена.", show_alert=True)
     t = store.xo_liking_tasks.pop(ph, None)
     if t and not t.done():
         t.cancel()
@@ -341,6 +357,10 @@ async def cb_mng_xo_stop(cb: CallbackQuery):
 @router.callback_query(F.data.startswith("mng_xo_del:"))
 async def cb_mng_xo_del(cb: CallbackQuery):
     ph = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    tasks = await db.db_get_xo_tasks_by_owner(uid)
+    if not any(t["phone"] == ph for t in tasks):
+        return await cb.answer("Задача не найдена.", show_alert=True)
     t = store.xo_liking_tasks.pop(ph, None)
     if t and not t.done():
         t.cancel()

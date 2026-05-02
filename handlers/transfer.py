@@ -415,6 +415,8 @@ async def cb_trf_accept(cb: CallbackQuery):
 @router.callback_query(F.data.startswith("trf_decline:"))
 async def cb_trf_decline(cb: CallbackQuery):
     token = cb.data.split(":", 1)[1]
+    # Читаем до удаления, чтобы уведомить отправителя
+    rec = await db.db_transfer_get(token)
     await db.db_transfer_delete(token)
     await cb.answer("Передача отклонена.")
     try:
@@ -422,3 +424,14 @@ async def cb_trf_decline(cb: CallbackQuery):
     except Exception:
         pass
     await restore_main_menu(bot, cb.message.chat.id, cb.from_user.id)
+    # Уведомляем отправителя
+    if rec:
+        try:
+            n = len(rec.get("phones") or [])
+            await notify_owner(
+                rec["from_uid"],
+                f"❌ Пользователь <code>{cb.from_user.id}</code> отклонил передачу "
+                f"<b>{n}</b> аккаунт(ов). Аккаунты остаются у вас."
+            )
+        except Exception:
+            pass

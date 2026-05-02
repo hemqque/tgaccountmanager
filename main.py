@@ -102,8 +102,11 @@ async def _callback_guard_mw(handler, event: CallbackQuery, data):
         return await handler(event, data)
     uid = event.from_user.id if event.from_user else 0
     if uid:
+        # Отменяем висящий ask_with_cancel, чтобы кнопки имели приоритет.
+        # store.set_action НЕ сбрасываем здесь: управление action —
+        # ответственность каждого хендлера (особенно важно для задач
+        # с интерактивным вводом кода/прокси в фоновом Task'е).
         cancel_pending_ask(uid)
-        store.set_action(uid, None)
     return await handler(event, data)
 
 
@@ -172,6 +175,13 @@ async def _on_startup():
         log.warning("_on_startup: get_me() failed: %s", e)
     ar_manager.set_notifier(notify_owner)
     set_admin_notifier(_notify_admins)
+    # Удаляем устаревшие токены передачи (TTL из config.TRANSFER_TOKEN_TTL)
+    try:
+        expired = await db.db_transfer_cleanup_expired()
+        if expired:
+            log.info("Cleaned up %d expired transfer token(s).", expired)
+    except Exception as _e:
+        log.warning("transfer cleanup: %s", _e)
     asyncio.create_task(run_health_check_loop())
     asyncio.create_task(ldv_scheduler(store, notify_func=notify_owner))
     asyncio.create_task(xo_liking_scheduler(store, notify_func=notify_owner))

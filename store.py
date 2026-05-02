@@ -73,11 +73,12 @@ class Store:
 
     # ───────────────── Helpers ─────────────────
     def reset_user(self, uid: int) -> None:
-        """Полная очистка пользовательских dialog-данных (после Главное меню)."""
+        """Полная очистка пользовательских dialog-данных (после Главное меню).
+        progress_msg НЕ сбрасывается намеренно: если фоновая задача ещё работает,
+        _finish_progress сама удалит запись когда завершится."""
         for d in (self.temp_photos, self.mass_data, self.ldv_data, self.xo_data,
                   self.selected_accs, self.photo_collecting,
-                  self.collected_photos, self.active_action,
-                  self.progress_msg):
+                  self.collected_photos, self.active_action):
             d.pop(uid, None)
 
     def is_busy(self, uid: int) -> bool:

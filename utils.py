@@ -189,7 +189,7 @@ async def ask_with_cancel(bot: Bot, chat_id: int, uid: int,
     if old and not old.done():
         old.cancel()
 
-    fut: asyncio.Future = asyncio.get_event_loop().create_future()
+    fut: asyncio.Future = asyncio.get_running_loop().create_future()
     _pending_text[uid] = fut
 
     try:

@@ -159,6 +159,13 @@ async def cb_adm_admins_del(cb: CallbackQuery):
     if not raw:
         return
     user_id = int(raw.strip())
+    # Защита от удаления последнего администратора
+    all_admins = await db.db_admins_get_all()
+    if len(all_admins) <= 1:
+        return await cb.message.answer(
+            "❌ Нельзя удалить последнего администратора. "
+            "Сначала добавьте другого."
+        )
     await db.db_admins_remove(user_id)
     await cb.message.answer(f"🗑 Админ удалён: <code>{user_id}</code>")
 

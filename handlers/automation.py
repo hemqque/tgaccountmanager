@@ -276,7 +276,7 @@ async def cb_mass_what_confirm(cb: CallbackQuery):
     if "bio" in what:
         txt = await ask_with_cancel(bot, chat_id, uid,
             "📝 Пришлите БИО (каждое с новой строки).\nРандомно раздаются по аккаунтам:")
-        if txt is None:
+        if not txt:
             return await restore_main_menu(bot, chat_id, uid, "Отменено.")
         md["bios"] = [s.strip() for s in txt.splitlines() if s.strip()]
     if "photo" in what:
@@ -298,7 +298,9 @@ async def cb_mass_photodone(cb: CallbackQuery):
     md["photos"] = photos
     await cb.answer()
     if not md.get("targets"):
-        return await cb.message.answer("❌ Цели потеряны.")
+        store.mass_data.pop(uid, None)
+        await restore_main_menu(bot, cb.message.chat.id, uid, "❌ Цели потеряны.")
+        return
     await _mass_run(cb.message.chat.id, uid, md)
 
 
@@ -467,7 +469,9 @@ async def cb_ldvr_photodone(cb: CallbackQuery):
     targets = d.get("targets") or []
     await cb.answer()
     if not targets or not photos:
-        return await cb.message.answer("❌ Целей или фото нет.")
+        store.ldv_data.pop(uid, None)
+        await restore_main_menu(bot, cb.message.chat.id, uid, "❌ Целей или фото нет.")
+        return
 
     async def _runner():
         if d.get("delay_min", 0) > 0:
@@ -617,7 +621,9 @@ async def cb_xor_photodone(cb: CallbackQuery):
     targets = d.get("targets") or []
     await cb.answer()
     if not targets or not photos:
-        return await cb.message.answer("❌ Целей или фото нет.")
+        store.xo_data.pop(uid, None)
+        await restore_main_menu(bot, cb.message.chat.id, uid, "❌ Целей или фото нет.")
+        return
 
     async def _runner():
         await _start_progress(bot, cb.message.chat.id, uid, total=len(targets), store=store, title="💘 Рега XO")
