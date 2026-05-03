@@ -10,7 +10,7 @@ import time
 from typing import Optional
 
 from aiogram import Router, F
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, BaseFilter
 from aiogram.types import Message, CallbackQuery
 from aiogram.exceptions import TelegramBadRequest
 
@@ -20,6 +20,7 @@ from bot_globals import (
     bot, store, task_queue,
     _grp_index_cache, _signin_sessions, _tdata_sessions,
     _trf_selection, _transfer_pending, _man_sel_ctx, _man_selection,
+    _share_pending, _shr_selection, _shr_grp_selection,
     kb, home_btn, notify_owner,
 )
 from utils import (
@@ -27,6 +28,7 @@ from utils import (
     has_pending,
 )
 from global_proxy import apply_global_to_unproxied
+from profile_music import get_user_music_dir
 
 log = logging.getLogger("start")
 router = Router(name="start")
@@ -44,6 +46,10 @@ async def handle_start(msg: Message):
     if args.startswith("tr_"):
         from handlers.transfer import _handle_transfer_incoming
         await _handle_transfer_incoming(msg, uid, args[3:])
+        return
+    if args.startswith("sh_"):
+        from handlers.share import _handle_share_incoming
+        await _handle_share_incoming(msg, uid, args[3:])
         return
 
     is_admin = await db.db_admins_check(uid)
@@ -73,6 +79,9 @@ async def handle_cancel(msg: Message):
     _transfer_pending.pop(uid, None)
     _man_sel_ctx.pop(uid, None)
     _man_selection.pop(uid, None)
+    _share_pending.pop(uid, None)
+    _shr_selection.pop(uid, None)
+    _shr_grp_selection.pop(uid, None)
     await restore_main_menu(bot, msg.chat.id, uid, "✅ Действие отменено.")
 
 
@@ -103,6 +112,9 @@ async def handle_home(msg: Message):
     _transfer_pending.pop(uid, None)
     _man_sel_ctx.pop(uid, None)
     _man_selection.pop(uid, None)
+    _share_pending.pop(uid, None)
+    _shr_selection.pop(uid, None)
+    _shr_grp_selection.pop(uid, None)
     await restore_main_menu(bot, msg.chat.id, uid, "Возврат в главное меню.")
 
 
@@ -117,6 +129,9 @@ async def cb_action_cancel(cb: CallbackQuery):
     _transfer_pending.pop(uid, None)
     _man_sel_ctx.pop(uid, None)
     _man_selection.pop(uid, None)
+    _share_pending.pop(uid, None)
+    _shr_selection.pop(uid, None)
+    _shr_grp_selection.pop(uid, None)
     try:
         await cb.message.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -146,7 +161,8 @@ async def handle_section_accounts(msg: Message):
             [("📡 Применить глобальные прокси", "acc_apply_global")],
             [("🏷 Смена username", "auto_rtag"),
              ("🔑 Смена 2FA", "acc_2fa_bulk")],
-            [("🔄 Передать аккаунты", "acc_transfer")],
+            [("🔄 Передать аккаунты", "acc_transfer"),
+             ("🤝 Общий доступ",     "acc_share")],
             [home_btn()],
         ),
     )
@@ -295,6 +311,48 @@ async def handle_photo(msg: Message):
     n = len(store.get_temp_photos(uid))
     try:
         await msg.answer(f"📷 Фото {n} принято.")
+    except Exception:
+        pass
+
+
+class _IsMusicCollecting(BaseFilter):
+    async def __call__(self, message: Message) -> bool:
+        return bool(store.music_collecting.get(message.from_user.id))
+
+
+@router.message(_IsMusicCollecting(), F.audio | F.document)
+async def handle_music_file(msg: Message):
+    """
+    Сборщик MP3 файлов во время массового залива.
+    Срабатывает только когда store.music_collecting[uid] == True.
+    """
+    uid = msg.from_user.id
+    if has_pending(uid):
+        return
+
+    audio = None
+    if msg.audio:
+        audio = msg.audio
+    elif msg.document and msg.document.mime_type and "audio" in msg.document.mime_type:
+        audio = msg.document
+    if not audio:
+        return
+
+    folder = get_user_music_dir(uid)
+    os.makedirs(folder, exist_ok=True)
+    fname = f"{int(time.time() * 1000)}_{audio.file_unique_id}.mp3"
+    path = os.path.join(folder, fname)
+    try:
+        f = await bot.get_file(audio.file_id)
+        await bot.download_file(f.file_path, destination=path)
+        store.add_temp_music(uid, path)
+    except Exception as e:
+        log.warning("download music: %s", e)
+        return
+
+    n = len(store.get_temp_music(uid))
+    try:
+        await msg.answer(f"🎵 Трек {n} принят.")
     except Exception:
         pass
 

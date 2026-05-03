@@ -6,6 +6,7 @@ handlers/automation.py — Автоматизация: массовый зали
 
 import asyncio
 import logging
+import os
 import random
 import time
 from typing import Any, Dict, List, Optional
@@ -38,6 +39,7 @@ from handlers.helpers import (
 from reg_resume import register_ldv_resumable, register_xo_resumable
 from ldv_functions import register_one_ldv
 from xo_functions import register_one_xo
+from profile_music import set_birthday, set_profile_music, cleanup_user_music
 
 log = logging.getLogger("automation")
 router = Router(name="automation")
@@ -231,6 +233,7 @@ async def _mass_render_what(cb, uid: int, send_new: bool = False, header: str = 
         [(f"{'✅' if 'name'  in what else '⬜'} ✏️ Имена",  "mass_what_tog:name")],
         [(f"{'✅' if 'bio'   in what else '⬜'} 📝 Био",    "mass_what_tog:bio")],
         [(f"{'✅' if 'photo' in what else '⬜'} 📷 Фото",   "mass_what_tog:photo")],
+        [(f"{'✅' if 'music' in what else '⬜'} 🎵 Музыка + 🎂 д/р", "mass_what_tog:music")],
     ]
     if what:
         rows.append([("✅ Продолжить", "mass_what_confirm")])
@@ -285,6 +288,8 @@ async def cb_mass_what_confirm(cb: CallbackQuery):
         await bot.send_message(chat_id,
             "📸 Пришлите ФОТО (несколько). Затем нажмите «📸 Готово».",
             reply_markup=kb([("📸 Готово", "mass_photodone")], [("❌ Отмена", "action_cancel")]))
+    elif "music" in what:
+        await _mass_start_music_collect(chat_id, uid)
     else:
         await _mass_run(chat_id, uid, md)
 
@@ -296,6 +301,56 @@ async def cb_mass_photodone(cb: CallbackQuery):
     store.photo_collecting[uid] = False
     md = store.mass_data.get(uid) or {}
     md["photos"] = photos
+    await cb.answer()
+    if not md.get("targets"):
+        store.mass_data.pop(uid, None)
+        await restore_main_menu(bot, cb.message.chat.id, uid, "❌ Цели потеряны.")
+        return
+    if "music" in md.get("what_sel", set()):
+        await _mass_start_music_collect(cb.message.chat.id, uid)
+    else:
+        await _mass_run(cb.message.chat.id, uid, md)
+
+
+async def _mass_start_music_collect(chat_id: int, uid: int) -> None:
+    store.music_collecting[uid] = True
+    store.clear_temp_music(uid)
+    await bot.send_message(
+        chat_id,
+        "🎵 Пришлите MP3 файлы (аудио). Затем нажмите «🎵 Готово».\n"
+        "Если музыка не нужна — нажмите «⏭ Пропустить».\n\n"
+        "Будет установлено: 🎂 день рождения 11.02 + 🎵 музыка (только Premium).",
+        reply_markup=kb(
+            [("🎵 Готово", "mass_musicdone")],
+            [("⏭ Пропустить музыку", "mass_musicskip")],
+            [("❌ Отмена", "action_cancel")],
+        ),
+    )
+
+
+@router.callback_query(F.data == "mass_musicdone")
+async def cb_mass_musicdone(cb: CallbackQuery):
+    uid = cb.from_user.id
+    music_files = store.get_temp_music(uid)
+    store.music_collecting[uid] = False
+    md = store.mass_data.get(uid) or {}
+    md["music_files"] = music_files
+    await cb.answer()
+    if not md.get("targets"):
+        store.mass_data.pop(uid, None)
+        store.clear_temp_music(uid)
+        await restore_main_menu(bot, cb.message.chat.id, uid, "❌ Цели потеряны.")
+        return
+    await _mass_run(cb.message.chat.id, uid, md)
+
+
+@router.callback_query(F.data == "mass_musicskip")
+async def cb_mass_musicskip(cb: CallbackQuery):
+    uid = cb.from_user.id
+    store.music_collecting[uid] = False
+    store.clear_temp_music(uid)
+    md = store.mass_data.get(uid) or {}
+    md["music_files"] = []
     await cb.answer()
     if not md.get("targets"):
         store.mass_data.pop(uid, None)
@@ -339,6 +394,12 @@ async def _mass_run(chat_id: int, uid: int, md: dict) -> None:
                     except Exception:
                         pass
                     await cli(UploadProfilePhotoRequest(file=await cli.upload_file(photo_path)))
+                if "music" in what:
+                    await set_birthday(cli)
+                    music_files = md.get("music_files") or []
+                    if music_files:
+                        mp3_path = random.choice(music_files)
+                        await set_profile_music(cli, mp3_path)
                 ok += 1
                 await _update_progress(bot, uid, store, done_inc=1, current=None)
             except Exception as e:
@@ -348,9 +409,13 @@ async def _mass_run(chat_id: int, uid: int, md: dict) -> None:
         if "name" in what:  changed.append("имена")
         if "bio" in what:   changed.append("био")
         if "photo" in what: changed.append("фото")
+        if "music" in what: changed.append("🎵 музыка + 🎂 д/р")
         await _finish_progress(bot, uid, store,
             summary_extra=f"Обновлено: {ok}/{len(targets)}\nИзменено: {', '.join(changed)}")
         store.clear_temp_photos(uid)
+        store.clear_temp_music(uid)
+        if "music" in what:
+            cleanup_user_music(uid)
         store.mass_data.pop(uid, None)
         await restore_main_menu(bot, chat_id, uid)
 

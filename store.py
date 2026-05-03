@@ -41,6 +41,8 @@ class Store:
                                           errors, current}
       ldv_reg_cancel       — set(phone) — отмена регистрации LDV «партии»
       xo_reg_cancel        — set(phone) — отмена регистрации XO «партии»
+      music_collecting     — uid -> bool (в данный момент собираем MP3)
+      temp_music           — uid -> List[str] (пути к загруженным MP3)
     """
 
     def __init__(self) -> None:
@@ -71,6 +73,9 @@ class Store:
         self.ldv_reg_cancel: Set[str] = set()
         self.xo_reg_cancel: Set[str] = set()
 
+        self.music_collecting: Dict[int, bool] = {}
+        self.temp_music: Dict[int, List[str]] = {}
+
     # ───────────────── Helpers ─────────────────
     def reset_user(self, uid: int) -> None:
         """Полная очистка пользовательских dialog-данных (после Главное меню).
@@ -78,7 +83,8 @@ class Store:
         _finish_progress сама удалит запись когда завершится."""
         for d in (self.temp_photos, self.mass_data, self.ldv_data, self.xo_data,
                   self.selected_accs, self.photo_collecting,
-                  self.collected_photos, self.active_action):
+                  self.collected_photos, self.active_action,
+                  self.music_collecting, self.temp_music):
             d.pop(uid, None)
 
     def is_busy(self, uid: int) -> bool:
@@ -99,3 +105,13 @@ class Store:
     def clear_temp_photos(self, uid: int) -> None:
         self.temp_photos.pop(uid, None)
         self.collected_photos.pop(uid, None)
+
+    def add_temp_music(self, uid: int, path: str) -> None:
+        self.temp_music.setdefault(uid, []).append(path)
+
+    def get_temp_music(self, uid: int) -> List[str]:
+        return list(self.temp_music.get(uid, []))
+
+    def clear_temp_music(self, uid: int) -> None:
+        self.temp_music.pop(uid, None)
+        self.music_collecting.pop(uid, None)

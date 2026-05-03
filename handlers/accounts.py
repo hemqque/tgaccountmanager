@@ -761,7 +761,10 @@ async def cb_acc_list(cb: CallbackQuery):
         page = int(cb.data.split(":", 1)[1])
     except Exception:
         page = 0
-    accs = await db.db_get_accounts_by_owner(uid)
+    # Показываем и собственные, и shared аккаунты
+    accs = await db.db_get_accounts_visible_to(uid)
+    owned_count  = sum(1 for a in accs if not a.get("is_shared"))
+    shared_count = sum(1 for a in accs if a.get("is_shared"))
     per = config.ACCOUNTS_PER_PAGE
     total = len(accs)
     pages = max(1, (total + per - 1) // per)
@@ -773,8 +776,10 @@ async def cb_acc_list(cb: CallbackQuery):
         ph = a["phone"]
         un = a.get("username") or "-"
         nt = (a.get("note") or "")[:24]
+        shared_tag = "🤝 " if a.get("is_shared") else ""
         rows.append([
-            (f"{ph} (@{un})" + (f" - {nt}" if nt else ""), f"acc_card:{ph}")
+            (f"{shared_tag}{ph} (@{un})" + (f" - {nt}" if nt else ""),
+             f"acc_card:{ph}")
         ])
     nav = []
     if page > 0:
@@ -786,7 +791,9 @@ async def cb_acc_list(cb: CallbackQuery):
         rows.append(nav)
     rows.append([("Сбросить все сессии", "acc_reset_all")])
     rows.append([home_btn()])
-    text = f"Мои аккаунты\nВсего: {total}  Стр. {page+1}/{pages}"
+    shared_note = f"  (из них 🤝 {shared_count} shared)" if shared_count else ""
+    text = (f"Мои аккаунты\n"
+            f"Всего: {owned_count}{shared_note}  Стр. {page+1}/{pages}")
     try:
         await cb.message.edit_text(text, reply_markup=kb(*rows))
     except TelegramBadRequest:
@@ -827,11 +834,19 @@ async def cb_acc_reset_all(cb: CallbackQuery):
 # =================================================================
 # КАРТОЧКА АККАУНТА
 # =================================================================
-async def _render_account_card(phone: str, owner_id: int):
+async def _render_account_card(phone: str, viewer_id: int):
+    """Возвращает (text, keyboard) для карточки аккаунта.
+    viewer_id — тот, кто смотрит (может быть owner или shared-user).
+    """
     a = await db.db_get_account(phone)
-    if not a or a.get("owner_id") != owner_id:
+    if not a:
         return None, None
-    ar_settings = await db.db_ar_get_settings(owner_id, phone)
+    is_owner  = a.get("owner_id") == viewer_id
+    is_shared = (not is_owner) and await db.db_shared_check(phone, viewer_id)
+    if not is_owner and not is_shared:
+        return None, None
+
+    ar_settings = await db.db_ar_get_settings(viewer_id, phone)
     ar_on = bool(ar_settings.get("enabled"))
 
     own_proxy = (a.get("proxy") or "").strip()
@@ -846,20 +861,30 @@ async def _render_account_card(phone: str, owner_id: int):
             proxy_line = "без прокси"
 
     un = a.get("username") or "-"
+    shared_badge = " 🤝 [shared]" if is_shared else ""
     text = (
-        f"Аккаунт: {a['phone']} (@{un})\n"
+        f"Аккаунт: {a['phone']} (@{un}){shared_badge}\n"
         f"Группа: {a.get('grp') or '-'}\n"
         f"Заметка: {a.get('note') or '-'}\n"
         f"Прокси: {proxy_line}\n"
         f"Автоответ: {'включён' if ar_on else 'выключен'}"
     )
     rows = [
-        [("Имя", f"acc_name:{phone}"), ("Био", f"acc_bio:{phone}"), ("Username", f"acc_uname:{phone}")],
-        [("Фото", f"acc_photo:{phone}"), ("Заметка", f"acc_note:{phone}"), ("Группа", f"acc_grp:{phone}")],
-        [("🔑 2FA", f"acc_2fa:{phone}"), ("Приватность", f"acc_priv:{phone}"), ("Получить код", f"acc_code:{phone}")],
-        [("Удалить аккаунт", f"acc_del:{phone}")],
-        [("< Назад", "acc_list:0"), home_btn()],
+        [("Имя", f"acc_name:{phone}"), ("Био", f"acc_bio:{phone}"),
+         ("Username", f"acc_uname:{phone}")],
+        [("Фото", f"acc_photo:{phone}"), ("Заметка", f"acc_note:{phone}"),
+         ("Группа", f"acc_grp:{phone}")],
+        [("🔑 2FA", f"acc_2fa:{phone}"), ("Приватность", f"acc_priv:{phone}"),
+         ("Получить код", f"acc_code:{phone}")],
     ]
+    if is_owner:
+        # Полный набор только для владельца
+        rows.append([("Удалить аккаунт", f"acc_del:{phone}")])
+    else:
+        # Shared-пользователь не может удалять/передавать
+        rows.append([("🤝 Убрать доступ",
+                      f"shr_leave:{phone}")])
+    rows.append([("< Назад", "acc_list:0"), home_btn()])
     return text, kb(*rows)
 
 

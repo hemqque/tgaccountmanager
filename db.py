@@ -129,6 +129,21 @@ async def init_db() -> None:
                 created_at  REAL NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS share_tokens(
+                token       TEXT PRIMARY KEY,
+                from_uid    INTEGER NOT NULL,
+                phones_json TEXT NOT NULL,
+                created_at  REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS shared_accounts(
+                phone           TEXT    NOT NULL,
+                shared_with_uid INTEGER NOT NULL,
+                shared_by_uid   INTEGER NOT NULL,
+                shared_at       REAL    NOT NULL,
+                PRIMARY KEY (phone, shared_with_uid)
+            );
+
             -- Индексы для горячих запросов (планировщики проверяют каждые 10 сек)
             CREATE INDEX IF NOT EXISTS idx_ldv_pending
                 ON ldv_tasks(status, next_run);
@@ -142,6 +157,14 @@ async def init_db() -> None:
                 ON autoreply_settings(owner_id);
             CREATE INDEX IF NOT EXISTS idx_transfer_from
                 ON transfer_tokens(from_uid);
+            CREATE INDEX IF NOT EXISTS idx_share_from
+                ON share_tokens(from_uid);
+            CREATE INDEX IF NOT EXISTS idx_shared_with
+                ON shared_accounts(shared_with_uid);
+            CREATE INDEX IF NOT EXISTS idx_shared_by
+                ON shared_accounts(shared_by_uid);
+            CREATE INDEX IF NOT EXISTS idx_shared_phone
+                ON shared_accounts(phone);
             """
         )
         # Загрузить начальных админов
@@ -215,6 +238,7 @@ async def db_delete_account(phone: str) -> None:
         await db.execute("DELETE FROM xo_tasks WHERE phone=?", (phone,))
         await db.execute("DELETE FROM autoreply_settings WHERE phone=?", (phone,))
         await db.execute("DELETE FROM reg_state WHERE phone=?", (phone,))
+        await db.execute("DELETE FROM shared_accounts WHERE phone=?", (phone,))
         await db.commit()
 
 
@@ -816,3 +840,166 @@ async def db_transfer_delete_by_owner(from_uid: int) -> int:
         )
         await db.commit()
         return cur.rowcount or 0
+
+
+# =================================================================
+# ── SHARE TOKENS (общий доступ по ссылке) ────────────────────────
+# =================================================================
+
+async def db_share_create(token: str, from_uid: int,
+                          phones: List[str]) -> None:
+    """Сохраняет одноразовый токен общего доступа."""
+    async with _conn() as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO share_tokens"
+            "(token, from_uid, phones_json, created_at) VALUES (?,?,?,?)",
+            (token, from_uid,
+             json.dumps(phones, ensure_ascii=False), time.time()),
+        )
+        await db.commit()
+
+
+async def db_share_get(token: str) -> Optional[Dict[str, Any]]:
+    """Возвращает запись токена (с полем phones: List[str]) или None.
+    Автоматически удаляет токен если истёк (TTL из config.TRANSFER_TOKEN_TTL)."""
+    from config import TRANSFER_TOKEN_TTL
+    async with _conn() as db:
+        cur = await db.execute(
+            "SELECT * FROM share_tokens WHERE token=?", (token,)
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        if time.time() - (d.get("created_at") or 0) > TRANSFER_TOKEN_TTL:
+            await db.execute("DELETE FROM share_tokens WHERE token=?", (token,))
+            await db.commit()
+            return None
+        try:
+            d["phones"] = json.loads(d.get("phones_json") or "[]")
+        except Exception:
+            d["phones"] = []
+        return d
+
+
+async def db_share_delete(token: str) -> None:
+    async with _conn() as db:
+        await db.execute("DELETE FROM share_tokens WHERE token=?", (token,))
+        await db.commit()
+
+
+async def db_share_cleanup_expired() -> int:
+    """Удаляет все истёкшие токены шаринга. Возвращает количество удалённых."""
+    from config import TRANSFER_TOKEN_TTL
+    async with _conn() as db:
+        cur = await db.execute(
+            "DELETE FROM share_tokens WHERE created_at < ?",
+            (time.time() - TRANSFER_TOKEN_TTL,),
+        )
+        await db.commit()
+        return cur.rowcount or 0
+
+
+# =================================================================
+# ── SHARED ACCOUNTS (многовладельческий доступ) ──────────────────
+# =================================================================
+
+async def db_shared_add(phone: str, shared_with_uid: int,
+                        shared_by_uid: int) -> None:
+    """Добавляет запись: shared_with_uid получил доступ к phone от shared_by_uid."""
+    async with _conn() as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO shared_accounts"
+            "(phone, shared_with_uid, shared_by_uid, shared_at) VALUES (?,?,?,?)",
+            (phone, shared_with_uid, shared_by_uid, time.time()),
+        )
+        await db.commit()
+
+
+async def db_shared_remove(phone: str, shared_with_uid: int) -> None:
+    """Отзывает доступ конкретного пользователя к аккаунту."""
+    async with _conn() as db:
+        await db.execute(
+            "DELETE FROM shared_accounts WHERE phone=? AND shared_with_uid=?",
+            (phone, shared_with_uid),
+        )
+        await db.commit()
+
+
+async def db_shared_check(phone: str, uid: int) -> bool:
+    """True если uid имеет shared-доступ к phone (не как owner)."""
+    async with _conn() as db:
+        cur = await db.execute(
+            "SELECT 1 FROM shared_accounts WHERE phone=? AND shared_with_uid=?",
+            (phone, uid),
+        )
+        return (await cur.fetchone()) is not None
+
+
+async def db_shared_get_by_phone(phone: str) -> List[Dict[str, Any]]:
+    """Все пользователи, которым расшарен phone."""
+    async with _conn() as db:
+        cur = await db.execute(
+            "SELECT * FROM shared_accounts WHERE phone=? ORDER BY shared_at",
+            (phone,),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def db_shared_get_by_user(uid: int) -> List[Dict[str, Any]]:
+    """
+    Все аккаунты, которыми поделились С uid.
+    Возвращает записи с полями phone, shared_by_uid, shared_at,
+    username, grp, owner_id (из таблицы accounts).
+    """
+    async with _conn() as db:
+        cur = await db.execute(
+            "SELECT sa.phone, sa.shared_by_uid, sa.shared_at, "
+            "       a.username, a.grp, a.owner_id, a.note, a.proxy "
+            "FROM shared_accounts sa "
+            "LEFT JOIN accounts a ON a.phone = sa.phone "
+            "WHERE sa.shared_with_uid=? ORDER BY sa.shared_at",
+            (uid,),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def db_shared_get_by_sharer(uid: int) -> List[Dict[str, Any]]:
+    """
+    Все шаринги, которые uid создал (uid — владелец/инициатор доступа).
+    Возвращает (phone, shared_with_uid, shared_at, username).
+    """
+    async with _conn() as db:
+        cur = await db.execute(
+            "SELECT sa.phone, sa.shared_with_uid, sa.shared_at, a.username "
+            "FROM shared_accounts sa "
+            "LEFT JOIN accounts a ON a.phone = sa.phone "
+            "WHERE sa.shared_by_uid=? ORDER BY sa.phone, sa.shared_at",
+            (uid,),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def db_get_accounts_visible_to(uid: int) -> List[Dict[str, Any]]:
+    """
+    Возвращает все аккаунты, доступные uid: собственные + те, которыми
+    поделились. Shared-аккаунты помечены is_shared=1.
+    """
+    async with _conn() as db:
+        cur = await db.execute(
+            "SELECT phone, proxy, note, grp, username, owner_id, 0 AS is_shared "
+            "FROM accounts WHERE owner_id=? "
+            "UNION "
+            "SELECT a.phone, a.proxy, a.note, a.grp, a.username, "
+            "       a.owner_id, 1 AS is_shared "
+            "FROM accounts a "
+            "INNER JOIN shared_accounts sa ON sa.phone = a.phone "
+            "WHERE sa.shared_with_uid=? AND a.owner_id != ? "
+            "ORDER BY phone",
+            (uid, uid, uid),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]

@@ -244,11 +244,11 @@ async def ldv_liking_task(phone: str, owner_id: int, store,
                               Callable[[int, str], Awaitable[None]]
                           ] = None) -> None:
     """
-    Цикл лайкинга. Жив, пока:
-      • аккаунт есть в store.current_liking_phones,
-      • phone не в store.cancelled_phones,
-      • в БД задача не удалена.
-    Если phone in store.paused_phones — спит и продолжает.
+    Цикл лайкинга. Логика:
+      1. Отправляет 2 лайка в @leomatchbot
+      2. Ожидает ответное сообщение, проверяя на наличие упоминания о лимите
+      3. Если лимит не превышен, обновляет задачу в БД, назначая следующий запуск через 10 часов
+      4. Если лимит превышен, откладывает следующий цикл на случайное время
     """
     bot = LDV_BOT
     proxy = await get_proxy_for_account(phone, owner_id)
@@ -267,17 +267,34 @@ async def ldv_liking_task(phone: str, owner_id: int, store,
     store.current_liking_phones.add(phone)
     await db.db_update_ldv_task(phone, status="running")
 
-    # ── Предстартовая проверка ──────────────────────────────────
-    # Смотрим последнее сообщение от бота; если лимит — откладываем цикл
     try:
-        pre_msgs = await client.get_messages(LDV_BOT, limit=1)
-        if pre_msgs:
-            pre_text = (
-                getattr(pre_msgs[0], "message", "") or
-                getattr(pre_msgs[0], "text", "") or ""
-            ).lower()
-            if ("лимит" in pre_text or "исчерпан" in pre_text
-                    or "ограничен" in pre_text):
+        # Проверяем, не отменен ли процесс
+        if phone in store.cancelled_phones:
+            return
+            
+        # Отправляем 2 лайка
+        try:
+            await client.send_message(bot, "❤️")
+            await asyncio.sleep(random.uniform(2, 4))
+            await client.send_message(bot, "❤️")
+        except FloodWaitError as e:
+            log.warning("ldv flood %s: %s", phone, e.seconds)
+            await db.db_update_ldv_task(
+                phone, status="pending",
+                next_run=time.time() + e.seconds + 60
+            )
+            return
+        except Exception as e:
+            log.warning("ldv send heart %s: %s", phone, e)
+
+        # Ждем ответное сообщение от бота и проверяем на лимит
+        msg = await _wait_ldv_msg(phone, store, LDV_RESPONSE_TIMEOUT)
+        limit_hit = False
+
+        if msg is not None:
+            text = (msg.text or msg.message or "").lower()
+            if "лимит" in text or "исчерпан" in text or "ограничен" in text:
+                limit_hit = True
                 pause_min = random.uniform(LDV_LISTEN_LO, LDV_LISTEN_HI)
                 await db.db_update_ldv_task(
                     phone, status="pending",
@@ -287,119 +304,34 @@ async def ldv_liking_task(phone: str, owner_id: int, store,
                     try:
                         await notify_func(
                             owner_id,
-                            f"⏸ {phone}: LDV — лимит при старте, "
+                            f"⏸ {phone}: LDV — лимит, "
                             f"следующий цикл через {pause_min:.1f} мин.",
                         )
                     except Exception:
                         pass
-                store.current_liking_phones.discard(phone)
-                return  # планировщик перезапустит задачу позже
-    except Exception as e:
-        log.warning("ldv pre-check %s: %s", phone, e)
-    # ────────────────────────────────────────────────────────────
-
-    try:
-        while True:
-            if phone in store.cancelled_phones:
-                break
-            # пауза по запросу
-            if phone in store.paused_phones:
-                await asyncio.sleep(10)
-                continue
-
-            # ── Проверим, что задача ещё в БД ──
-            tasks = await db.db_get_ldv_tasks_by_owner(owner_id)
-            if not any(t["phone"] == phone for t in tasks):
-                break
-
-            # ── 1. Стартуем менюшку лайкинга — отправляем "1" ──
-            try:
-                await client.send_message(bot, "1")
-            except FloodWaitError as e:
-                log.warning("ldv flood %s: %s", phone, e.seconds)
-                await asyncio.sleep(min(e.seconds + 5, 600))
-                continue
-            except Exception as e:
-                log.warning("ldv send 1 %s: %s", phone, e)
-
-            await _wait_ldv_msg(phone, store, LDV_RESPONSE_TIMEOUT)
-
-            # ── 2. Лайкаем серию профилей ──
-            likes_this_cycle = random.randint(15, 30)
-            limit_hit = False
-            for i in range(likes_this_cycle):
-                if (phone in store.cancelled_phones
-                        or phone in store.paused_phones):
-                    break
+            elif "больше внимания" in text:
+                # Бот предлагает буст — отказываемся
+                btn = _find_reply_button(msg, "в другой раз")
+                reply_text = btn if btn else "В другой раз"
                 try:
-                    await client.send_message(bot, "❤️")
-                except FloodWaitError as e:
-                    await asyncio.sleep(min(e.seconds + 5, 600))
-                    break
-                except Exception as e:
-                    log.warning("ldv heart %s: %s", phone, e)
-                    break
+                    await client.send_message(bot, reply_text)
+                except Exception:
+                    pass
 
-                msg = await _wait_ldv_msg(phone, store, LDV_RESPONSE_TIMEOUT)
-                if msg is not None:
-                    text = (msg.text or msg.message or "").lower()
-                    if ("лимит" in text or "исчерпан" in text or
-                            "ограничен" in text):
-                        limit_hit = True
-                        if notify_func:
-                            try:
-                                await notify_func(
-                                    owner_id,
-                                    f"⏸ {phone}: LDV лимит. "
-                                    f"Жду следующего цикла."
-                                )
-                            except Exception:
-                                pass
-                        break
-                    elif "больше внимания" in text:
-                        # Бот предлагает «бустнуть» — отказываемся.
-                        # Ищем кнопку «В другой раз» в reply-клавиатуре;
-                        # если её нет — просто отправляем текст.
-                        btn = _find_reply_button(msg, "в другой раз")
-                        reply_text = btn if btn else "В другой раз"
-                        log.debug("ldv 'больше внимания' %s → '%s'",
-                                  phone, reply_text)
-                        try:
-                            await client.send_message(bot, reply_text)
-                        except Exception as e:
-                            log.warning("ldv attention-reply %s: %s",
-                                        phone, e)
-                        # ждём следующий ответ бота после нашего нажатия
-                        await _wait_ldv_msg(phone, store, LDV_RESPONSE_TIMEOUT)
-                await asyncio.sleep(random.uniform(2, 5))
-
-            # ── 3. Шагаем step и считаем next_run ──
-            try:
-                cur = next(
-                    (t for t in await db.db_get_ldv_tasks_by_owner(owner_id)
-                     if t["phone"] == phone), None
-                )
-                step = (cur["step"] if cur else 0) + 1
-            except Exception:
-                step = 1
-
-            pause_minutes = random.uniform(LDV_LISTEN_LO, LDV_LISTEN_HI)
-            next_run = time.time() + pause_minutes * 60
+        # Если лимита нет — планируем следующий запуск через 10 часов (36000 секунд)
+        if not limit_hit:
             await db.db_update_ldv_task(
-                phone, step=step, next_run=next_run, status="pending"
+                phone, status="pending",
+                next_run=time.time() + 36000,
             )
             if notify_func:
                 try:
                     await notify_func(
                         owner_id,
-                        f"💤 {phone}: цикл #{step} завершён "
-                        f"({'лимит' if limit_hit else 'ок'}). "
-                        f"Следующий через {pause_minutes:.1f} мин.",
+                        f"💤 {phone}: отправлено 2 лайка. Следующий цикл через 10 часов."
                     )
                 except Exception:
                     pass
-            # выходим — следующий цикл стартует ldv_scheduler-ом
-            break
 
     except Exception as e:
         log.warning("ldv_liking_task %s: %s", phone, e)
@@ -414,8 +346,6 @@ async def ldv_liking_task(phone: str, owner_id: int, store,
         )
     finally:
         store.current_liking_phones.discard(phone)
-        store.cancelled_phones.discard(phone)   # чистим, чтобы сет не рос вечно
-        # Клиент общий (client_pool) — не отключаем
 
 
 # =================================================================
@@ -428,8 +358,7 @@ async def ldv_scheduler(store,
                         task_queue=None) -> None:
     """
     Каждые 10с забирает все pending ldv_tasks с next_run<=now и
-    стартует ldv_liking_task через asyncio.create_task (не через TaskQueue,
-    чтобы не блокировать очередь регистраций).
+    стартует ldv_liking_task через asyncio.create_task.
     Если phone уже в current_liking_phones — пропускает.
     """
     while True:
@@ -445,16 +374,11 @@ async def ldv_scheduler(store,
                     store.cancelled_phones.discard(phone)
                     continue
 
-                # Помечаем ДО create_task, чтобы следующая итерация шедулера
-                # (через 10 сек) не создала дублирующий таск для того же phone.
                 store.current_liking_phones.add(phone)
 
                 async def _runner(p=phone, o=owner_id):
                     await ldv_liking_task(p, o, store, notify_func=notify_func)
 
-                # LDV-лайкинг всегда запускается как отдельная задача,
-                # а не через TaskQueue — чтобы не блокировать очередь
-                # регистраций и массовых операций (Semaphore(2)).
                 asyncio.create_task(_runner())
         except Exception as e:
             log.warning("ldv_scheduler error: %s", e)

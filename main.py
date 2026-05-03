@@ -7,6 +7,7 @@ main.py — Точка входа бота-менеджера фермы Telegra
   accounts.py     — аккаунты, TData/Session импорт, прокси
   automation.py   — массовый залив, рега LDV/XO, подписка, username, AR
   transfer.py     — передача аккаунтов по одноразовой ссылке
+  share.py        — общий доступ к аккаунтам (2+ пользователей)
   manage.py       — задачи LDV/XO, пролайк, отмена регистраций
   admin.py        — whitelist, администраторы, все аккаунты
 """
@@ -34,7 +35,7 @@ from xo_functions import xo_liking_scheduler
 from client_pool import session_watchdog as _session_watchdog
 
 # Импортируем роутеры хендлеров
-from handlers import start, accounts, automation, transfer, manage, admin
+from handlers import start, accounts, automation, transfer, manage, admin, share
 
 logging.basicConfig(
     level=logging.INFO,
@@ -117,6 +118,7 @@ dp.include_router(start.router)
 dp.include_router(accounts.router)
 dp.include_router(automation.router)
 dp.include_router(transfer.router)
+dp.include_router(share.router)
 dp.include_router(manage.router)
 dp.include_router(admin.router)
 
@@ -182,6 +184,13 @@ async def _on_startup():
             log.info("Cleaned up %d expired transfer token(s).", expired)
     except Exception as _e:
         log.warning("transfer cleanup: %s", _e)
+    # Удаляем устаревшие токены шаринга
+    try:
+        expired_shr = await db.db_share_cleanup_expired()
+        if expired_shr:
+            log.info("Cleaned up %d expired share token(s).", expired_shr)
+    except Exception as _e:
+        log.warning("share cleanup: %s", _e)
     asyncio.create_task(run_health_check_loop())
     asyncio.create_task(ldv_scheduler(store, notify_func=notify_owner))
     asyncio.create_task(xo_liking_scheduler(store, notify_func=notify_owner))
